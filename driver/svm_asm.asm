@@ -526,8 +526,16 @@ _SvmVmrunLoop:
     mov     [rsp + 020h + GCTX_R15], r15
 
     ;
-    ; STEP 9 — dispatch to C handler.  Guest RAX/RSP live in VMCB.Save
-    ; and are synced into / out of GuestContext by SvmExitHandler.
+    ; STEP 9 — sync Guest RSP from VMCB.Save to GUEST_CONTEXT
+    ; (optimization: done here in ASM instead of the C handler)
+    ;
+    mov     rax, [rsp + 0A8h]                   ; VmcbVa
+    mov     rax, [rax + VMCB_SAVE_RSP_OFFSET]   ; Vmcb->Save.Rsp
+    mov     [rsp + 020h + GCTX_RSP], rax        ; GuestContext->Rsp
+    ;
+    ; STEP 10 — dispatch to C handler.
+    ; Guest RSP is now valid in GuestContext;
+    ; Guest RAX is synced inside SvmExitHandler.
     ;
     lea     rcx, [rsp + 020h]
     call    SvmExitHandler

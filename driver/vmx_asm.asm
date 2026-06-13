@@ -184,7 +184,11 @@ AsmVmxExitHandler PROC
     mov     [rsp + 008h], rcx
     mov     [rsp + 010h], rdx
     mov     [rsp + 018h], rbx
-    mov     [rsp + 020h], rsp
+    ; Save Guest RSP from VMCS (replaces the old Host RSP placeholder).
+    ; RAX and RCX already saved above — clobbering them here is safe.
+    mov     rcx, VMCS_GUEST_RSP_ENCODING
+    vmread  rax, rcx
+    mov     [rsp + 020h], rax
     mov     [rsp + 028h], rbp
     mov     [rsp + 030h], rsi
     mov     [rsp + 038h], rdi

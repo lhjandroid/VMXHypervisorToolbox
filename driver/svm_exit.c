@@ -69,20 +69,15 @@ BOOLEAN SvmExitHandler(PGUEST_CONTEXT GuestContext)
     GuestContext->Rax = Vmcb->Save.Rax;
 
     /*
-     * CRITICAL: Sync Guest RSP from VMCB into GuestContext at #VMEXIT entry.
+     * OPTIMIZATION: Guest RSP is now synced directly in the ASM VMRUN
+     * loop (AsmSvmLaunch) from Vmcb->Save.Rsp into GUEST_CONTEXT.Rsp.
+     * GuestContext->Rsp is already valid — no sync needed here.
      *
-     * Same rationale as the VMX side (vmx_exit.c): the ASM stub pushes GP
-     * registers onto the Host stack, so GuestContext->Rsp is a placeholder.
-     * The real Guest RSP lives in VMCB.Save.Rsp.
-     *
-     * By syncing here, ALL subsequent handlers (DR access, CR access, etc.)
-     * can use GpRegs[4] / GuestContext->Rsp directly without special-casing.
-     * On exit, we write it back to VMCB.Save.Rsp.
+     * On exit, we still write it back to Vmcb->Save.Rsp.
      */
-    GuestContext->Rsp = Vmcb->Save.Rsp;
 
-    /* Increment exit counter */
-    InterlockedIncrement64(&CpuCtx->Common.ExitCount);
+    /* Increment exit counter (percpu — single writer, no atomic RMW needed) */
+    CpuCtx->Common.ExitCount++;
 
     /* Reset TLB control for next VMRUN (don't keep flushing) */
     Vmcb->Control.TlbCtl = TLB_CONTROL_DO_NOTHING;

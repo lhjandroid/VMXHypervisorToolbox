@@ -12,6 +12,14 @@
 #include "anti_anti_debug.h"
 #include "../common/shared.h"
 
+/*
+ * VMX_EXIT_DIAGNOSTICS — Define to enable per-VM-Exit heartbeat logging
+ * and early diagnostic messages in VmxExitHandler.  Undefine for
+ * production/release builds to eliminate unnecessary VMREADs and
+ * Interlocked operations in the VM-Exit hot path.
+ */
+/* #define VMX_EXIT_DIAGNOSTICS */
+
 /* ========================================================================= */
 /*  Forward Declarations                                                     */
 /* ========================================================================= */
@@ -56,6 +64,7 @@ BOOLEAN VmxExitHandler(PGUEST_CONTEXT GuestContext)
     ULONG   CpuIndex;
     BOOLEAN Result = TRUE;
 
+#ifdef VMX_EXIT_DIAGNOSTICS
     /*
      * DIAGNOSTIC: Per-CPU early exit counting with rapid-fire detection.
      *
@@ -76,48 +85,29 @@ BOOLEAN VmxExitHandler(PGUEST_CONTEXT GuestContext)
      */
     static volatile LONG64 s_EarlyExitCount[64] = { 0 };
     static volatile LONG64 s_LastReportedCount[64] = { 0 };
+#endif
 
     /*
-     * CRITICAL: Sync Guest RSP from VMCS into GuestContext at VM-Exit entry.
+     * OPTIMIZATION: Guest RSP is now synced directly in the ASM stub
+     * (AsmVmxExitHandler) via vmread VMCS_GUEST_RSP → GUEST_CONTEXT.Rsp.
+     * No VmxRead needed here — GuestContext->Rsp is already valid.
      *
-     * The ASM stub saves GP registers to the stack-based GUEST_CONTEXT, but
-     * RSP in that struct is a placeholder — it holds the Host stack pointer
-     * at the time of the push, NOT the Guest RSP. The real Guest RSP lives
-     * in VMCS_GUEST_RSP.
-     *
-     * By syncing it here (like HyperDbg does in VmxVmexitHandler), ALL
-     * subsequent handlers can use GpRegs[4] / GuestContext->Rsp directly
-     * without needing special-case code for RegIndex==4.
-     *
-     * On VM-Exit completion, we write back the (potentially modified) value
-     * to VMCS_GUEST_RSP before VMRESUME.
+     * On VM-Exit completion, we write back the (potentially modified)
+     * value to VMCS_GUEST_RSP before VMRESUME.
      */
-    GuestContext->Rsp = VmxRead(VMCS_GUEST_RSP);
 
     ExitReason = (ULONG)VmxRead(VMCS_EXIT_REASON);
     CpuIndex = KeGetCurrentProcessorNumber();
 
     /* Increment exit counter */
     if (CpuIndex < g_MaxProcessors) {
+#ifdef VMX_EXIT_DIAGNOSTICS
         LONG64 Count = InterlockedIncrement64(&g_VmxState.CpuContexts[CpuIndex].ExitCount);
 
-        /*
-         * HEARTBEAT DIAGNOSTIC: Log every 10000th exit per-CPU.
-         * This creates a timeline showing what exit reasons appear
-         * over time. When the system freezes, the last heartbeat message
-         * in WinDbg tells us exactly where the system got stuck.
-         *
-         * Also includes rapid-fire detection at 100K intervals.
-         */
         if (CpuIndex < 64) {
             s_EarlyExitCount[CpuIndex] = Count;
 
-            /*
-             * Heartbeat: Log periodically FOREVER (no upper bound).
-             * - Every 100 exits for the first 5000 (detailed early diagnosis)
-             * - Every 10000 exits thereafter (low-overhead long-term monitoring)
-             * Uses ring buffer only — safe in VMX root mode.
-             */
+            /* Heartbeat: every 100 exits for first 5000, then every 10000 */
             if ((Count <= 5000 && (Count % 100) == 0) ||
                 (Count > 5000 && (Count % 10000) == 0)) {
                 VMXROOT_LOG_INFO("HEARTBEAT CPU%u: count=%lld reason=%u qual=0x%llX RIP=0x%llX",
@@ -136,6 +126,10 @@ BOOLEAN VmxExitHandler(PGUEST_CONTEXT GuestContext)
                 }
             }
         }
+#else
+        /* percpu counter — single writer, no atomic RMW needed */
+        g_VmxState.CpuContexts[CpuIndex].ExitCount++;
+#endif
     }
 
     /* Check if Guest requested an EPT TLB flush */
@@ -166,6 +160,7 @@ BOOLEAN VmxExitHandler(PGUEST_CONTEXT GuestContext)
         return FALSE;   /* Shut down VMX */
     }
 
+#ifdef VMX_EXIT_DIAGNOSTICS
     /*
      * EARLY DIAGNOSTIC: Log the first N VM-Exits from each CPU.
      * Uses lock-free ring buffer (VMXROOT_LOG_*) — safe in VMX root mode.
@@ -191,6 +186,7 @@ BOOLEAN VmxExitHandler(PGUEST_CONTEXT GuestContext)
             }
         }
     }
+#endif
 
     /* Dispatch by exit reason */
     switch (ExitReason & 0xFFFF) {
