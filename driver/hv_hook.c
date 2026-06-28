@@ -76,8 +76,26 @@ static PTHUNK_PAGE AllocateThunkPage(ULONG BaseId)
 
     RtlZeroMemory(Page, sizeof(THUNK_PAGE));
 
-    /* NonPagedPool is executable on WDK 7600 target */
+    /*
+     * Thunk code pages MUST be executable.
+     *
+     * NonPagedPool is executable on Windows 7 / early Windows 10
+     * (pre-1803).  On Windows 10 1803+ with NonPagedPoolNx as the
+     * default pool type, ExAllocatePoolWithTag may return NX memory.
+     *
+     * If the pool returns NX memory on a bare-metal system, thunk
+     * execution will #PF in the Guest and the hook framework won't
+     * work.  This is a platform constraint shared with the EPT/NPT
+     * hook page allocators.
+     *
+     * TODO: For Win10 1803+ compatibility, switch to
+     *       MmAllocateContiguousMemorySpecifyCache(MmCached)
+     *       which always returns executable memory on x86-64.
+     */
     Page->CodeBase = ExAllocatePoolWithTag(NonPagedPool, PAGE_SIZE, VMX_TAG);
+    if (Page->CodeBase) {
+        LOG_DEBUG("Thunk page allocated at 0x%p (verify executable on Win10 1803+)", Page->CodeBase);
+    }
     if (!Page->CodeBase) {
         ExFreePoolWithTag(Page, VMX_TAG);
         return NULL;
@@ -270,6 +288,44 @@ static PGENERIC_HOOK_ENTRY FindHookByAddress(ULONG64 TargetVa)
 }
 
 /* ========================================================================= */
+/*  Zombie Entry Garbage Collection (H-7 / Audit #1)                          */
+/* ========================================================================= */
+
+/*
+ * CollectGarbageZombies — Free entries on the zombie list.
+ *
+ * Called ONLY from GenericHookInstall (PASSIVE_LEVEL, during IOCTL) and
+ * GenericHookCleanup (driver unload).  Never called from the VM-Exit
+ * handler path, so there is no risk of racing with GenericHookDecide.
+ *
+ * Caller may hold g_GenericHookState.Lock — this function temporarily
+ * releases it around ExFreePoolWithTag so we don't call the pool
+ * allocator under a spin lock (which is forbidden).
+ */
+static VOID CollectGarbageZombies(VOID)
+{
+    PGENERIC_HOOK_ENTRY Zombie, Next;
+    PGENERIC_HOOK_ENTRY LocalList;
+    KIRQL               OldIrql;
+
+    KeAcquireSpinLock(&g_GenericHookState.Lock, &OldIrql);
+
+    LocalList = g_GenericHookState.ZombieListHead;
+    g_GenericHookState.ZombieListHead = NULL;
+    g_GenericHookState.ZombieCount = 0;
+
+    KeReleaseSpinLock(&g_GenericHookState.Lock, OldIrql);
+
+    /* Free outside the lock — safe, list is now private. */
+    Zombie = LocalList;
+    while (Zombie) {
+        Next = Zombie->Next;
+        ExFreePoolWithTag(Zombie, VMX_TAG);
+        Zombie = Next;
+    }
+}
+
+/* ========================================================================= */
 /*  Initialization / Cleanup                                                 */
 /* ========================================================================= */
 
@@ -306,6 +362,9 @@ VOID GenericHookCleanup(VOID)
         Entry = Next;
     }
 
+    /* H-7: free all zombie entries (deferred-free list) */
+    CollectGarbageZombies();
+
     /* Free all thunk pages */
     Page = g_GenericHookState.ThunkPageHead;
     while (Page) {
@@ -341,6 +400,16 @@ NTSTATUS GenericHookInstall(
     ULONG               HookId;
 
     if (!g_GenericHookState.Initialized) return STATUS_UNSUCCESSFUL;
+
+    /*
+     * H-7: garbage-collect zombie entries if the list has grown.
+     * This is the safe point: we are at PASSIVE_LEVEL (IOCTL
+     * handler), no dispatcher thread can hold a stale pointer
+     * to an entry that was removed before this point.
+     */
+    if (g_GenericHookState.ZombieCount >= HOOK_ZOMBIE_GC_THRESHOLD) {
+        CollectGarbageZombies();
+    }
 
     KeAcquireSpinLock(&g_GenericHookState.Lock, &OldIrql);
 
@@ -485,10 +554,24 @@ NTSTATUS GenericHookRemove(ULONG HookId)
             /* H-3: return thunk slot to its page so it can be re-used. */
             FreeThunk(Entry->ThunkAddress);
 
+            /*
+             * H-7 (Audit #1): Move to zombie list instead of freeing.
+             *
+             * GenericHookDecide reads the hook list WITHOUT the lock
+             * (VM-Exit hot path).  If we ExFreePool this entry now,
+             * a concurrent GenericHookDecide that already obtained a
+             * pointer to it could read freed memory.
+             *
+             * Moving to the zombie list keeps the memory valid until
+             * a safe garbage-collection point (next install or cleanup).
+             */
+            Entry->Next = g_GenericHookState.ZombieListHead;
+            g_GenericHookState.ZombieListHead = Entry;
+            g_GenericHookState.ZombieCount++;
+
             KeReleaseSpinLock(&g_GenericHookState.Lock, OldIrql);
 
             LOG_INFO("Generic hook removed: id=%u, VA=0x%llX", HookId, Entry->TargetVirtualAddress);
-            ExFreePoolWithTag(Entry, VMX_TAG);
             return STATUS_SUCCESS;
         }
         Prev = Entry;
@@ -518,7 +601,10 @@ VOID GenericHookRemoveAll(VOID)
             /* H-3: return thunk slot. */
             FreeThunk(Entry->ThunkAddress);
         }
-        ExFreePoolWithTag(Entry, VMX_TAG);
+        /* H-7: move to zombie list; GC will free later. */
+        Entry->Next = g_GenericHookState.ZombieListHead;
+        g_GenericHookState.ZombieListHead = Entry;
+        g_GenericHookState.ZombieCount++;
         Entry = Next;
     }
 

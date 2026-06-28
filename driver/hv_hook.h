@@ -108,6 +108,25 @@ typedef struct _GENERIC_HOOK_STATE {
     ULONG               NextHookId;     /* Auto-increment ID */
     KSPIN_LOCK          Lock;
 
+    /*
+     * H-7 (Audit #1): Zombie list for deferred-free entries.
+     *
+     * GenericHookDecide reads the hook list WITHOUT holding Lock
+     * (it runs in the VM-Exit hot path at arbitrary IRQL).
+     * If GenericHookRemove freed an entry immediately after
+     * unlinking it, a concurrent GenericHookDecide could read
+     * freed memory → use-after-free.
+     *
+     * Fix: GenericHookRemove moves entries here instead of
+     * calling ExFreePoolWithTag.  A garbage-collection pass
+     * (triggered by GenericHookInstall when the zombie count
+     * exceeds HOOK_ZOMBIE_GC_THRESHOLD, and always by
+     * GenericHookCleanup) frees them safely — by that point
+     * any in-flight dispatcher thread has long since returned.
+     */
+    PGENERIC_HOOK_ENTRY ZombieListHead;
+    ULONG               ZombieCount;
+
     /* Thunk pages (linked list, each page holds THUNKS_PER_PAGE stubs) */
     PTHUNK_PAGE         ThunkPageHead;
     ULONG               ThunkPageCount;
@@ -122,6 +141,9 @@ typedef struct _GENERIC_HOOK_STATE {
     BOOLEAN             Initialized;
 
 } GENERIC_HOOK_STATE, *PGENERIC_HOOK_STATE;
+
+/* H-7: GC threshold — free zombies when count exceeds this */
+#define HOOK_ZOMBIE_GC_THRESHOLD    64
 
 extern GENERIC_HOOK_STATE g_GenericHookState;
 

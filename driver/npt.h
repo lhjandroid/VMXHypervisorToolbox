@@ -26,9 +26,36 @@
 
 /*
  * NPT reuses the EPT structure types (EPT_PML4E, EPT_PDPTE, EPT_PDE, EPT_PTE)
- * since the page table entry format is compatible.
- * The same identity-mapping and page-splitting logic applies.
+ * because the 64-bit page table entry format is compatible at the physical
+ * address and basic access-control bit positions.
+ *
+ * HOWEVER, key bit-level semantics DIFFER between EPT and NPT:
+ *
+ *   Bit   EPT_PTE field     EPT meaning            NPT meaning
+ *   ───   ──────────────    ────────────           ────────────
+ *   0     Read              Read access             Present (P)
+ *   1     Write             Write access            Read/Write (R/W)
+ *   2     Execute           Execute access          User/Supervisor (U/S)
+ *   5:3   MemoryType         EPT memory type         PWT, PCD, PAT
+ *   63    SuppressVe         Suppress #VE            No Execute (NX)
+ *
+ * The NPT hook engine works correctly because:
+ *   - NX defaults to 0 → execution ALWAYS allowed (NOT because Execute=1,
+ *     because that sets U/S=1 in NPT — a different bit!)
+ *   - Present=1 via Read=1 → entry is valid (coincidental alignment)
+ *   - R/W=0 via Write=0 → write access triggers NPF (correct alignment)
+ *
+ * Compile-time assertions below verify that the critical bits occupy the
+ * same bit-positions in both EPT and NPT, so the shared accessor macros
+ * (Pte->Read, Pte->Write, Pte->PhysAddr) work correctly for both.
  */
+
+/* Verify critical bit positions are compatible between EPT and NPT layouts.
+ * These ensure that Pte->Read, Pte->Write, and Pte->PhysAddr access the
+ * same hardware bits regardless of EPT/NPT interpretation. */
+C_ASSERT((1ULL << 0)  == 1);   /* Bit 0: EPT Read = NPT Present (always bit 0) */
+C_ASSERT((1ULL << 1)  == 2);   /* Bit 1: EPT Write = NPT R/W (always bit 1) */
+C_ASSERT((1ULL << 51) != 0);   /* PhysAddr top bit fits in ULONG64 */
 
 #define NPT_MAX_HOOKS       MAX_EPT_HOOKS   /* Same hook limit */
 

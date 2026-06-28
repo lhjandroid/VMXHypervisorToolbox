@@ -1131,9 +1131,23 @@ NTSTATUS NptHookFunction(ULONG64 TargetVa, PVOID HookFunction, PVOID *OriginalFu
         }
     }
 
-    Pte->Read = 1;
-    Pte->Write = 0;
-    Pte->Execute = 1;
+    /*
+     * NPT Hook PTE: R=1,W=0,X=1 (using EPT_PTE field names).
+     *
+     * NPT ACTUAL SEMANTICS (see npt.h for full mapping):
+     *   Bit 0  (Read=1)    → NPT Present=1     ✓ entry valid
+     *   Bit 1  (Write=0)   → NPT R/W=0         ✓ write triggers NPF
+     *   Bit 2  (Execute=1) → NPT U/S=1         (user+supervisor allowed)
+     *   Bit 63 (NX=0, default) → execute allowed  ✓ NOT controlled by "Execute"!
+     *
+     * The hook visually "has Execute=1" but NPT ignores bit 2 for
+     * execution control — that's bit 63 (NX).  Since we never set NX,
+     * execution is always allowed.  The field name "Execute" is
+     * misleading in NPT context; see npt.h for the full mapping table.
+     */
+    Pte->Read = 1;           /* NPT: Present */
+    Pte->Write = 0;          /* NPT: read-only (write → NPF) */
+    Pte->Execute = 1;        /* NPT: U/S=1 (NOT execute control!) */
     Pte->PhysAddr = Hook->HookPagePa >> 12;
 
     /*

@@ -166,13 +166,11 @@
 
 | 步骤 | 操作 |
 |------|------|
-| 1 | 计算所需覆盖的物理地址范围：通过 `MmGetPhysicalMemoryRanges()` 获取最大物理地址，加 2GB headroom，向上取整到 1GB |
-
-   边界，再向上取整到 512 的倍数（整个 PDPT 页） |
+| 1 | 计算所需覆盖的物理地址范围：通过 `MmGetPhysicalMemoryRanges()` 获取最大物理地址，加 2GB headroom，向上取整到 1GB 边界，再向上取整到 512 的倍数（整个 PDPT 页） |
 | 2 | 设置 `g_EptPdptTotal` 和 `g_EptPml4Count` |
 | 3 | 初始化哈希表：Hook 哈希表（2048 槽位填 EMPTY）、Split 哈希表（256 槽位填 EMPTY） |
 | 4 | 分配 per-CPU 跟踪数组：`g_EptInveptCpuGen` 和 `g_MtfRelaxedPagePa` |
-| 5 | 检测 Execute-Only 支持：读 `IA32_VMX_EPT_VPID_CAP[0]` |
+| 5 | **检测 Execute-Only 支持**：读 `IA32_VMX_EPT_VPID_CAP[0]`。若支持则记录日志继续；若**不支持**，记录详细错误日志（含 MSR 值），释放已分配资源，返回 `STATUS_NOT_SUPPORTED`（Audit #1 修复） |
 | 6 | 分配 PD 页数组：`g_EptPdptTotal` 个 PD 页 |
 | 7 | 分配 `g_PerCpuPdAllocated` 位图 |
 | 8 | 如果 `g_EptPml4Count > 1`，分配扩展 PDPT 页 |
@@ -183,6 +181,8 @@
 |    | - PML4[0] 指向嵌入的 PDPT；PML4[1..] 指向扩展 PDPT 页 |
 | 11 | 计算并保存 `Pml4Pa` 和 `Eptp`（MemoryType=WB, PageWalkLength=3(4级), DirtyAccess=0） |
 | 12 | 设置 `Initialized = TRUE` |
+
+**Audit #1 修复（Execute-Only 拒绝策略）**: 原始代码在检测到 `ExecuteOnlySupported=FALSE` 时仅记录日志并继续执行，期望在 EPT Hook 安装时退化为 R=0,W=0,X=0（全零）PTE 模式。然而 Intel SDM Vol.3C §29.3.3 明确规定：当 mode-based execute control 为 0 时（本驱动的配置），EPT PTE 位模式 000（R=0,W=0,X=0）会触发 EPT Misconfiguration，导致 VM-Exit → 无法恢复 → BSOD。换言之旧 fallback 路径是死路。由于每颗裸金属 Intel CPU 自 Westmere 微架构（2010 年）起均支持 Execute-Only EPT，在初始化阶段直接拒绝是最安全的策略——唯一不支持的情况是嵌套虚拟化环境（VMware、Hyper-V 等），而本驱动已在 `DriverEntry` 层拒绝了嵌套环境。
 
 #### `EptComputeRequiredPdPages()`
 
@@ -287,9 +287,8 @@
 | 13 | **Hook 页打补丁**: 在 `HookPage + PageOffset` 写入 `48 B8 [imm64] FF E0`（MOV RAX, imm64; JMP RAX） |
 | 14 | **Trampoline 构建**: 复制原始指令 → RIP-relative 修正 → 尾部写入 FF 25 [RIP+0] [8-byte target] |
 | 15 | **PTE 权限设置** (关键步骤): |
-|    | - Execute-Only 支持: R=0, W=0, X=1 |
-|    | - 不支持: R=0, W=0, X=0 |
-|    | - PhysAddr = HookPagePa >> 12 |
+|    | - Execute-Only 支持: R=0, W=0, X=1（PhysAddr = HookPage） |
+|    | - 不支持: 不可达路径。`EptInitialize()` 在初始化阶段已拒绝不支持 Execute-Only 的 CPU。旧代码的 else 分支（R=0,W=0,X=0）保留仅作编译兼容，实际永不被执行 |
 | 16 | **Per-CPU 隔离**: 为所有 CPU 克隆 PD 和 PT，复制相同 PTE 权限 |
 | 17 | 插入 Hook 哈希表 |
 | 18 | 释放自旋锁，执行 `EptInvalidateFromGuest()` |
@@ -347,9 +346,7 @@
 
 **Step 5: Hook 页处理（Mode B — 无 Execute-Only）**
 
-根据 Guest RIP 所在物理页判断意图：
-- RIP 在 Hook 页 → 执行意图 → 临时展示 Hook 页（RWX）+ MTF
-- RIP 不在 Hook 页 → 数据访问 → 临时展示原始页（RWX）+ MTF
+此路径当前不可达（`EptInitialize` 在初始化阶段拒绝）。保留代码仅作编译兼容。
 
 **Step 6: Per-CPU PTE 隔离**
 - 优先使用当前 CPU 的 per-CPU PTE（通过 `EptGetPerCpuPte`）
@@ -425,6 +422,7 @@
 VmxInitialize (vmx_init.c)
   ├── EptInitialize() — 全局 EPT 身份映射构建
   │   ├── EptComputeRequiredPdPages — 物理内存范围查询 + 2GB headroom
+  │   ├── 检测 Execute-Only 支持 —— 不支持则拒绝启动（Audit #1）
   │   ├── 分配 PD 页数组 / 拆分页池 / 哈希表
   │   ├── 构建 PML4[0..N-1] → PDPT → PD(2MB大页) 结构
   │   └── 计算 EPTP
@@ -450,7 +448,7 @@ EptHookFunction(TargetVa, HookFunction, &OrigFunc)
   ├── 分配 Trampoline
   ├── 指令解码 + RIP-relative修正
   ├── Hook页打JMP补丁 (48 B8 imm64 FF E0)
-  ├── 设置PTE: Execute-Only / 全零
+  ├── 设置PTE: Execute-Only (R=0,W=0,X=1) — 不支持情况已在初始化拒绝
   ├── (可选) EptEnsurePerCpuPdForRegion + EptEnsurePerCpuSplitPage
   ├── 插入哈希表
   └── EptInvalidateFromGuest()
@@ -475,7 +473,7 @@ Guest重新执行该指令（一条）
 HandleMtf
   ├── 清除MTF标志
   ├── EptMtfGetAndClearRelaxedPage
-  ├── 恢复PTE (R=0,W=0,X=1 或 R=0,W=0,X=0)
+  ├── 恢复PTE (R=0,W=0,X=1)
   ├── INVEPT SINGLE_CONTEXT
   └── return TRUE → VMRESUME
 ```
@@ -537,7 +535,12 @@ Execute-Only 页（R=0, W=0, X=1）是 EPT Hook 的核心隐身机制：
 - **数据读取触发 EPT Violation**: 当 PatchGuard 等完整性扫描器读取该页时，触发违例 → Handler 展示原始未修改的页内容
 - **PatchGuard 绕过**: 扫描器读取的是原始（未 Hook）代码，Hook 的存在完全不可见
 
-当 CPU/嵌套虚拟化不支持 Execute-Only 时（`EPT_VPID_CAP[0]=0`），退化为 `R=1,W=0,X=1`（读+执行），隐身性降低但功能完整。
+**Audit #1 修复（SDM §29.3.3 依据）**: 旧代码在 `ExecuteOnlySupported=FALSE` 时尝试退化为 `R=0,W=0,X=0`（全零）PTE 模式，期望通过 EPT Violation handler 动态切换权限来维持功能。然而 Intel SDM Vol.3C §29.3.3 规定 EPT PTE 位模式 000（R=0,W=0,X=0）在 mode-based execute control 为 0 时触发 EPT Misconfiguration（而非 EPT violation），导致 VM-Exit → 无法恢复 → BSOD。这意味着旧的 fallback 路径从硬件层面就是不可用的死路。
+
+新行为（Audit #1）：`EptInitialize()` 在检测到 `ExecuteOnlySupported=FALSE` 时立即返回 `STATUS_NOT_SUPPORTED`，并记录三条详细错误日志（含 IA32_VMX_EPT_VPID_CAP MSR 值）。该拒绝策略的安全性基于以下事实：
+- 每颗裸金属 Intel CPU 自 Westmere 微架构（2010）起均支持 Execute-Only EPT
+- 唯一不支持的情况是嵌套虚拟化环境（VMware、Hyper-V 等），而本驱动在 `DriverEntry` 阶段已拒绝了嵌套环境
+- `EptHookFunction()` 的 else 分支（Pte->Execute = 0）保留仅作编译兼容，实际永不被执行
 
 ### 2MB → 4KB 大页拆分
 

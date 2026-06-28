@@ -1094,17 +1094,36 @@ NTSTATUS EptInitialize(VOID)
 
     /*
      * Detect Execute-Only EPT support (IA32_VMX_EPT_VPID_CAP bit 0).
-     * Many nested hypervisors (VMware, Hyper-V) do NOT expose this bit,
-     * which means R=0,W=0,X=1 causes EPT Misconfiguration instead of
-     * working as an execute-only page.  When unsupported, we fall back
-     * to R=1,W=0,X=1 (read+execute) for hook pages.
+     *
+     * Intel SDM Vol.3C §29.3.3: EPT PTE bit pattern 100 (R=0,W=0,X=1)
+     * is the Execute-Only mode used by our hook engine.  Pattern 000
+     * (R=0,W=0,X=0) would cause EPT Misconfiguration when mode-based
+     * execute control is 0 — our exact configuration.
+     *
+     * Every bare-metal Intel CPU since Westmere (2010) supports
+     * Execute-Only EPT.  The only scenario where bit 0 is cleared is
+     * inside a nested hypervisor (VMware, Hyper-V, etc.), which this
+     * driver already rejects at DriverEntry.
+     *
+     * BUG FIX (Audit #1): On bare metal, refuse to run if Execute-Only
+     * is NOT supported — the 000-fallback path (R=0,W=0,X=0) causes
+     * EPT Misconfiguration per SDM §29.3.3 and cannot work.
      */
     {
         ULONG64 EptVpidCap = __readmsr(MSR_IA32_VMX_EPT_VPID_CAP);
         g_EptHookState.ExecuteOnlySupported = (EptVpidCap & 1) != 0;
 
-        LOG_INFO("EPT Execute-Only pages: %s",
-                 g_EptHookState.ExecuteOnlySupported ? "supported" : "NOT supported (fallback to R+X)");
+        if (!g_EptHookState.ExecuteOnlySupported) {
+            LOG_ERROR("EPT Execute-Only NOT supported — refusing to run on bare metal");
+            LOG_ERROR("  IA32_VMX_EPT_VPID_CAP = 0x%llX (bit 0 = 0)", EptVpidCap);
+            LOG_ERROR("  This indicates a nested hypervisor or defective CPU.");
+            /* Clean up what we've allocated so far. */
+            if (g_EptInveptCpuGen) { ExFreePoolWithTag(g_EptInveptCpuGen, 'tpeC'); g_EptInveptCpuGen = NULL; }
+            if (g_MtfRelaxedPagePa) { ExFreePoolWithTag((PVOID)g_MtfRelaxedPagePa, 'tpeM'); g_MtfRelaxedPagePa = NULL; }
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        LOG_INFO("EPT Execute-Only pages: supported");
     }
 
     /*

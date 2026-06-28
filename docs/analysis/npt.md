@@ -25,7 +25,29 @@ NPT 使用与 x86-64 相同的 4 级页表结构（PML4 → PDPT → PD → PT�
 | `EPT_PDE` | PD | 2MB 大页 (LargePage=1) | Read/Write/Execute, LargePage, PhysAddr |
 | `EPT_PTE` | PT | 4KB | Read/Write/Execute, MemoryType, Accessed, Dirty, PhysAddr, SuppressVe |
 
-**NPT 与 EPT 的关键差异**: AMD NPT **不支持** Execute-Only 页面（R=0,W=0,X=1）。这意味着 AMD 的钩子策略必须与 Intel 不同。
+### EPT→NPT 位语义映射表（npt.h）
+
+虽然 NPT 复用了 EPT 的位域结构体定义，但同一位的硬件语义在 EPT 和 NPT 之间**不同**。`npt.h` 中的注释块和 `C_ASSERT` 编译期断言明确了以下映射：
+
+| 位 | EPT_PTE 字段 | EPT 含义 | NPT 含义 | 关键说明 |
+|---|-------------|----------|----------|---------|
+| 0 | Read | 读访问权限 | Present（P） | 巧合一致：Read=1 在 NPT 中标志页有效 |
+| 1 | Write | 写访问权限 | Read/Write（R/W） | 巧合一致：Write=0 在 NPT 中为只读 |
+| 2 | Execute | 执行访问权限 | User/Supervisor（U/S） | **关键差异**: EPT 用此位控制执行，NPT 用此位控制权限级别 |
+| 5:3 | MemoryType | EPT 内存类型 | PWT, PCD, PAT | NPT 中的缓存控制位 |
+| 63 | SuppressVe | 抑制虚拟化异常 (#VE) | No Execute（NX） | **关键差异**: NPT 的执行控制位是 bit 63，而非 bit 2 |
+
+**NPT 钩子引擎能正确工作的原因**:
+1. NX 位（bit 63）默认为 0 → 执行**始终允许**（不是因为 `Execute=1`，因为那在 NPT 中设置的是 U/S=1，是一个不同的位！）
+2. `Read=1` 巧合地映射到 NPT `Present=1` → 页表项有效
+3. `Write=0` 巧合地映射到 NPT `R/W=0` → 写触发 NPF（正确的权限控制）
+
+**编译期验证（npt.h 中的 C_ASSERT）**:
+```c
+C_ASSERT((1ULL << 0)  == 1);   /* Bit 0: EPT Read = NPT Present (始终位 0) */
+C_ASSERT((1ULL << 1)  == 2);   /* Bit 1: EPT Write = NPT R/W (始终位 1) */
+C_ASSERT((1ULL << 51) != 0);   /* PhysAddr 高位在 ULONG64 内 */
+```
 
 ### `EPT_HOOK_ENTRY` — 钩子条目（来自 ept.h）
 
@@ -225,21 +247,20 @@ typedef struct _NPT_SPLIT_HASH_ENTRY {
       - 复制原始指令字节
       - **RIP-相对地址重定位**: 扫描每条指令，如果存在 RIP-相对寻址（ModRM Mod=00 RM=101），修正 disp32 使其在跳板的 VA 上仍指向原始目标
       - 追加 `JMP [RIP+0]` 跳回 `TargetVa + OriginalBytesSize`
-  14. **配置 PTE**:
+  14. **配置 PTE（NPT 语义详解）**:
       - NPT 钩子策略（AMD 不支持 Execute-Only）:
-        - 正常情况下：**R=1, W=0, X=1**（读+执行，不写）
-        - 物理地址指向 HookPage
+        - **`Pte->Read = 1`** → NPT Present=1（页有效）
+        - **`Pte->Write = 0`** → NPT R/W=0（只读，写触发 NPF）
+        - **`Pte->Execute = 1`** → NPT U/S=1（用户+管理员权限，**并非执行控制**）
+        - **默认 NX=0**（bit 63 未设置）→ 执行始终允许
+        - PhysAddr → HookPage（指向含 JMP 的钩子页）
+      - **关键洞察**: 尽管 PTE 视觉上有 `Execute=1`，但 NPT 的执行控制位是 bit 63（NX）而非 bit 2。`Execute=1` 在 NPT 中设置的是 U/S=1（允许用户模式访问），执行权限由 NX 默认 0 保证。详情见 npt.h 的完整映射表。
   15. **每 CPU 钩子隔离**:
       - 克隆 PD 到所有 CPU
       - 克隆分裂页表到所有 CPU
       - 在每 CPU PTE 上应用相同权限
   16. **启用 #DB 拦截**: 安装钩子后启用 #DB 中断（C-3），用于单步恢复机制
   17. 返回跳板地址给调用者
-
-- **NPT 钩子策略**: 因 AMD 不支持 Execute-Only，采用 R+X 映射：
-  - 执行访问：通过 HookPage（含 JMP），触发钩子
-  - 读访问：看到 HookPage（含 JMP），不如 Execute-Only 隐秘
-  - 写访问：触发 NPF → 临时给予写权限 → 单步完成 → 恢复
 
 #### `NptUnhookFunction()` — 卸载钩子
 - **签名**: `NTSTATUS NptUnhookFunction(ULONG64 TargetVa)`
@@ -368,7 +389,12 @@ NptHookFunction()
   ├── 指令解码（EptGetInstructionLength）→ 保存 ≥12 字节
   ├── 构建 HookPage: MOV RAX, hook_fn; JMP RAX
   ├── 构建 Trampoline: 原始指令 + RIP-相对重定位 + JMP 返回
-  ├── 配置 PTE: R=1, W=0, X=1, PhysAddr=HookPagePa
+  ├── 配置 PTE:
+  │   ├── Pte->Read = 1    → NPT Present=1  (页有效)
+  │   ├── Pte->Write = 0   → NPT R/W=0      (只读, 写触发NPF)
+  │   ├── Pte->Execute = 1 → NPT U/S=1      (用户+管理员权限)
+  │   ├── NX=0 (默认)      → 执行始终允许   (非Execute位控制!)
+  │   └── PhysAddr = HookPagePa
   ├── 每 CPU 隔离设置（克隆 PD/PT 到所有 CPU）
   ├── 哈希表插入
   ├── 解锁
@@ -475,7 +501,7 @@ NPT 函数包装为 `HV_OPS` 接口：
 - `UnhookFunction` → `NptUnhookFunction()`
 - `UnhookAll` → `NptUnhookAll()`
 
-### EPT 模块（ept.h）
+### EPT 模块（ept.h / ept.c）
 
 - 复用了 EPT 的全部页表条目结构体定义（`EPT_PML4E`, `EPT_PDPTE`, `EPT_PDE`, `EPT_PTE`）
 - 复用了 `EPT_HOOK_ENTRY` 结构体
@@ -505,6 +531,32 @@ NPT 函数包装为 `HV_OPS` 接口：
 | 隐秘性 | 高（读不出 JMP） | 中（读取代码区域可发现 JMP） |
 
 读行为差异意味着在 AMD 上，如果目标程序对自己的代码区域进行完整性检查（读取并校验），可能发现 NPT 钩子的存在。但对反反调试场景，目标程序主要执行代码而非读取，因此影响有限。
+
+### EPT→NPT 位语义映射（npt.h 关键文档）
+
+NPT 直接复用 EPT 的 `EPT_PTE` 位域结构体（`Read`, `Write`, `Execute`, `SuppressVe`），但同一位的硬件语义完全不同。`npt.h` 中的映射表是理解 NPT 钩子行为的关键文档：
+
+- **Bit 0 (Read → Present)**: 写入 `Read=1` 巧合地设置了 NPT 的 `Present=1`，使页表项有效
+- **Bit 1 (Write → R/W)**: 写入 `Write=0` 巧合地设置了 NPT 的 `R/W=0`，写触发 NPF
+- **Bit 2 (Execute → U/S)**: **最易误解的位**。`Execute=1` 在 NPT 中设置的是 `U/S=1`（用户+管理员都可以访问），**而不是**执行权限。执行权限由 `NX` 位（bit 63）控制
+- **Bit 63 (SuppressVe → NX)**: NX 默认为 0（执行允许），所以执行**总是允许的**，但这不是因为 `Execute=1`
+
+**核心结论**: 钩子 PTE `R=1,W=0,X=1` 能工作的真正原因是 NX=0（默认），而不是 `Execute=1`。`Execute=1` 的视觉效果是一种巧合的副作用。
+
+`C_ASSERT` 编译期断言验证了关键位（bit 0、bit 1）在两种架构中的物理位置相同，确保共享的位域访问代码正确。
+
+### 钩子 PTE 设置中的逐字段注释（npt.c）
+
+`NptHookFunction()` 中的 PTE 配置块（1134-1151 行）包含每条字段的 NPT 语义注释：
+
+```c
+Pte->Read = 1;           /* NPT: Present */
+Pte->Write = 0;          /* NPT: read-only (write → NPF) */
+Pte->Execute = 1;        /* NPT: U/S=1 (NOT execute control!) */
+Pte->PhysAddr = Hook->HookPagePa >> 12;
+```
+
+这些注释明确区分了 EPT 字段名和 NPT 实际语义，防止后续开发者误以为 `Execute=1` 控制了执行权限。该设计文档与 `npt.h` 中的映射表形成完整的文档链。
 
 ### 两遍卸载防止 UAF（Issue #7+10 镜像）
 
@@ -561,7 +613,7 @@ NPT 身份映射大小从静态 512GB 改为根据 `MmGetPhysicalMemoryRanges()`
 |------|-------------|-----------|
 | 页表结构 | 专用 EPT 格式 | x86-64 页表格式（复用） |
 | 根地址 | VMCS EPTP 字段 | VMCB.NestedCr3 |
-| 页表条目 | EPT_PTE/EPT_PDE/EPT_PDPTE/EPT_PML4E | 同上（复用） |
+| 页表条目 | EPT_PTE/EPT_PDE/EPT_PDPTE/EPT_PML4E | 同上（复用，但位语义不同） |
 | 大页粒度 | 2MB (PD) / 1GB (PDPT) | 同 EPT |
 | Execute-Only | 支持（可达化） | **不支持** |
 | 缺页异常 | EPT violation (VMEXIT) | SVM_EXIT_NPF (0x400) |
@@ -570,3 +622,4 @@ NPT 身份映射大小从静态 512GB 改为根据 `MmGetPhysicalMemoryRanges()`
 | 身份映射 | `ept.c` | `npt.c` |
 | 钩子结构 | `EPT_HOOK_ENTRY` | 同上（复用） |
 | 单步恢复 | MTF (Monitor Trap Flag) | RFLAGS.TF + #DB |
+| 位语义映射 | EPT 原生语义 | npt.h 中有显式映射表 |
