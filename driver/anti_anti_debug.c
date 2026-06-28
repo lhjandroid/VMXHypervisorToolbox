@@ -629,28 +629,18 @@ BOOLEAN AadHandleCpuid(PGUEST_CONTEXT GuestContext)
     __cpuidex(CpuInfo, Leaf, SubLeaf);
 
     /*
-     * CPUID Leaf 1 (ECX): Hypervisor Presence and VMX capability.
+     * CPUID Leaf 1 (ECX): Hide VMX/SVM capability.
      *
-     * CRITICAL DESIGN DECISION for nested virtualization (VMware L0):
+     * On bare metal with no Hyper-V, the hypervisor-present bit (bit 31)
+     * is already 0 — we clear it explicitly as defense-in-depth.
+     * Windows will NOT query hypervisor CPUID leaves (0x40000000+),
+     * behaving as if running on bare metal.
      *
-     * Windows already decided at boot time to use VMCALL enlightenments
-     * because VMware (L0) advertised CPUID.1:ECX[31]=1. That decision
-     * is CACHED and cannot be un-done by clearing the bit later.
-     *
-     * Previous approach: Clear bit 31 → Windows "thinks" no hypervisor,
-     * but STILL uses cached VMCALL paths → contradictory state.
-     *
-     * New approach: KEEP bit 31 set (hypervisor present), and provide
-     * minimal compatible hypervisor CPUID leaves (0x40000000+) that
-     * tell Windows we support the enlightenments it's already using.
-     * This way Windows's cached decision is consistent with what
-     * CPUID reports.
-     *
-     * We still hide VMX (bit 5) to prevent nested VM creation.
+     * We also hide VMX (bit 5) to prevent guest code from attempting
+     * VMXON or probing VMX capability MSRs.
      */
     if (Leaf == 1) {
-        /* KEEP hypervisor present bit (bit 31) — Windows already cached it */
-        /* CpuInfo[2] &= ~(1 << CPUID_HYPERVISOR_BIT); -- REMOVED */
+        CpuInfo[2] &= ~(1 << CPUID_HYPERVISOR_BIT);   /* Clear: no hypervisor */
         CpuInfo[2] &= ~(1 << 5);                       /* Hide VMX (Intel VT-x) */
     }
     else if (Leaf == 0x80000001) {
@@ -672,76 +662,16 @@ BOOLEAN AadHandleCpuid(PGUEST_CONTEXT GuestContext)
         CpuInfo[2] = 0;
         CpuInfo[3] = 0;
     }
-    else if (Leaf == 0x40000000) {
-        /*
-         * Hypervisor identification leaf.
-         *
-         * EAX = Maximum hypervisor CPUID leaf
-         * EBX/ECX/EDX = Hypervisor vendor signature.
-         *
-         * Report "Microsoft Hv" as vendor string (Windows expects this format),
-         * with max leaf = 0x40000001 (minimal). Leaf 0x40000001 returns "Hv#0"
-         * (non-conformant) so Windows will NOT use VMCALL enlightenments.
-         */
-        CpuInfo[0] = 0x40000001;   /* Max leaf = 0x40000001 (minimal) */
-        CpuInfo[1] = 0x7263694D;   /* "Micr" */
-        CpuInfo[2] = 0x666F736F;   /* "osof" */
-        CpuInfo[3] = 0x76482074;   /* "t Hv" */
-    }
-    else if (Leaf == 0x40000001) {
-        /*
-         * Hypervisor interface identification.
-         *
-         * "Hv#0" = non-conformant interface.
-         * Tells Windows we do NOT conform to the Microsoft Hv interface.
-         * Windows will NOT attempt to use Hyper-V Synthetic MSRs or SynIC,
-         * preventing BSOD from writes to non-existent MSRs 0x40000100+.
-         */
-        CpuInfo[0] = 0x30237648;   /* "Hv#0" — NOT conformant */
-        CpuInfo[1] = 0;
-        CpuInfo[2] = 0;
-        CpuInfo[3] = 0;
-    }
-    else if (Leaf == 0x40000002) {
-        /*
-         * Leaf 0x40000002: Build version info.
-         * Return zeros — no specific build version to report.
-         */
-        CpuInfo[0] = 0;
-        CpuInfo[1] = 0;
-        CpuInfo[2] = 0;
-        CpuInfo[3] = 0;
-    }
-    else if (Leaf == 0x40000003) {
-        /*
-         * Leaf 0x40000003: HV_X64_CPUID_FEATURES (Partition Privilege Flags).
-         * Return zeros — no enlightenments advertised ("Hv#0" = non-conformant).
-         */
-        CpuInfo[0] = 0;
-        CpuInfo[1] = 0;
-        CpuInfo[2] = 0;
-        CpuInfo[3] = 0;
-    }
-    else if (Leaf == 0x40000004) {
-        /*
-         * Leaf 0x40000004: Implementation Recommendations.
-         * Return zeros — no recommendations (non-conformant interface).
-         */
-        CpuInfo[0] = 0;
-        CpuInfo[1] = 0;
-        CpuInfo[2] = 0;
-        CpuInfo[3] = 0;
-    }
-    else if (Leaf >= 0x40000005 && Leaf <= 0x40000006) {
-        /*
-         * Leaves 0x40000005-0x40000006: Implementation Limits + HW features.
-         * Return zeros — no special limits or hardware features to report.
-         */
-        CpuInfo[0] = 0;
-        CpuInfo[1] = 0;
-        CpuInfo[2] = 0;
-        CpuInfo[3] = 0;
-    }
+    /*
+     * Hypervisor CPUID leaves (0x40000000-0x400000FF):
+     *
+     * On bare metal with hypervisor-present bit cleared (CPUID.1:ECX[31]=0),
+     * Windows will never query these leaves.  If something does query them
+     * anyway (e.g. third-party detection tools), we let the raw hardware
+     * CPUID pass through — on bare metal it returns all zeros.
+     *
+     * No emulation needed: we do NOT advertise any hypervisor interface.
+     */
 
     /* Additional spoofing for target processes with anti-anti-debug enabled. */
     if (IsFeatureEnabled(GuestCr3, AAD_HIDE_CPUID)) {

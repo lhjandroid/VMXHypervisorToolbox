@@ -167,6 +167,44 @@ NTSTATUS DriverEntry(
     LOG_INFO("Detected %u active processors", g_MaxProcessors);
 
     /*
+     * BARE-METAL ONLY CHECK
+     *
+     * This driver MUST run on bare metal — no nested virtualization,
+     * no Hyper-V, no VMware, no VirtualBox, no KVM, no Xen.
+     *
+     * Check 1: Is any hypervisor already present?  (CPUID.1:ECX[31])
+     * Check 2: Is Windows Hyper-V / VBS active?       (CPUID.0x40000001 Hv#1)
+     *
+     * If either is true, log the reason and bail out immediately.
+     */
+    if (HvIsRunningUnderHypervisor()) {
+        LOG_ERROR("============================================================");
+        LOG_ERROR("VMXToolbox requires BARE METAL — hypervisor already present.");
+        LOG_ERROR("Nested virtualization is NOT supported.  Disable Hyper-V,");
+        LOG_ERROR("Virtualization-Based Security (VBS), and any other hypervisor");
+        LOG_ERROR("before loading this driver.");
+        LOG_ERROR("  bcdedit /set hypervisorlaunchtype off");
+        LOG_ERROR("  bcdedit /set vsmlaunchtype off     (for VBS/HVCI)");
+        LOG_ERROR("============================================================");
+        LogTerminate();
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (HvIsHyperVEnabled()) {
+        LOG_ERROR("============================================================");
+        LOG_ERROR("VMXToolbox requires BARE METAL — Windows Hyper-V detected.");
+        LOG_ERROR("Disable Hyper-V before loading this driver:");
+        LOG_ERROR("  bcdedit /set hypervisorlaunchtype off");
+        LOG_ERROR("  bcdedit /set vsmlaunchtype off");
+        LOG_ERROR("Then reboot and try again.");
+        LOG_ERROR("============================================================");
+        LogTerminate();
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    LOG_INFO("Bare-metal environment confirmed — proceeding with initialization");
+
+    /*
      * M-6: generate a per-boot random nonce for the VMCALL shutdown
      * sequence so that malicious in-guest Ring 0 code cannot unload
      * our hypervisor with a known magic.

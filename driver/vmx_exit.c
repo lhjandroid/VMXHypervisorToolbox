@@ -678,23 +678,46 @@ BOOLEAN VmxExitHandler(PGUEST_CONTEXT GuestContext)
             ULONG64 CurrentEntryInfo = VmxRead(VMCS_CTRL_VMENTRY_INT_INFO);
 
             if (!(CurrentEntryInfo & INTERRUPT_INFO_VALID)) {
-                /* No injection pending — safe to re-inject the IDT event */
-                VmxWrite(VMCS_CTRL_VMENTRY_INT_INFO, (ULONG)IdtVecInfo);
-
-                /* Re-inject error code if the original event had one */
-                if (IdtVecInfo & INTERRUPT_INFO_DELIVER_ERR_CODE) {
-                    ULONG64 IdtVecErrCode = VmxRead(VMCS_IDT_VECTORING_ERRCODE);
-                    VmxWrite(VMCS_CTRL_VMENTRY_EXCEPTION_ERRCODE, (ULONG)IdtVecErrCode);
-                }
+                ULONG IntType = (ULONG)((IdtVecInfo >> INTERRUPT_INFO_TYPE_SHIFT) & 0x7);
 
                 /*
-                 * Re-inject instruction length for software interrupts/exceptions.
-                 * Intel SDM: VM-Entry instruction length is required when injecting
-                 * software interrupts (INT n), software exceptions (#BP, #OF), or
-                 * privileged software exceptions (INT1).
+                 * BUG FIX (Audit #6): Skip re-injection for external interrupts.
+                 *
+                 * Intel SDM Vol. 3C, Section 27.2.4: "If the VM exit was caused
+                 * by an external interrupt that was delivered through the IDT,
+                 * the VMCS IDT-vectoring information field will have bit 31 set
+                 * and the interrupt type field set to 0 (External interrupt)."
+                 *
+                 * External interrupts are ACKNOWLEDGED by the LAPIC before
+                 * being delivered — the interrupt is consumed.  Re-injecting
+                 * via VMENTRY_INT_INFO with type=0 would cause VM-Entry to
+                 * fail because type 0 is not a valid injection type per
+                 * SDM §26.6.1 (valid types: 2/3/4/5/6).
+                 *
+                 * Since PIN_BASED_EXTERNAL_INT_EXIT is 0, external interrupts
+                 * pass directly through Guest IDT and this path should rarely
+                 * trigger — but when must-be-1 bits force NMI-exiting on,
+                 * external-interrupt IDT-vectoring can occur.
                  */
-                {
-                    ULONG IntType = (ULONG)((IdtVecInfo >> INTERRUPT_INFO_TYPE_SHIFT) & 0x7);
+                if (IntType == INTERRUPT_TYPE_EXTERNAL) {
+                    /* External interrupt was already consumed by LAPIC;
+                     * silently drop — the Guest LAPIC will re-assert it. */
+                } else {
+                    /* No injection pending — safe to re-inject the IDT event */
+                    VmxWrite(VMCS_CTRL_VMENTRY_INT_INFO, (ULONG)IdtVecInfo);
+
+                    /* Re-inject error code if the original event had one */
+                    if (IdtVecInfo & INTERRUPT_INFO_DELIVER_ERR_CODE) {
+                        ULONG64 IdtVecErrCode = VmxRead(VMCS_IDT_VECTORING_ERRCODE);
+                        VmxWrite(VMCS_CTRL_VMENTRY_EXCEPTION_ERRCODE, (ULONG)IdtVecErrCode);
+                    }
+
+                    /*
+                     * Re-inject instruction length for software interrupts/exceptions.
+                     * Intel SDM: VM-Entry instruction length is required when injecting
+                     * software interrupts (INT n), software exceptions (#BP, #OF), or
+                     * privileged software exceptions (INT1).
+                     */
                     if (IntType == INTERRUPT_TYPE_SOFTWARE_INT ||
                         IntType == INTERRUPT_TYPE_SOFTWARE_EXCEPTION ||
                         IntType == INTERRUPT_TYPE_PRIV_SOFTWARE_INT) {
@@ -855,10 +878,22 @@ static BOOLEAN HandleCrAccess(PGUEST_CONTEXT Ctx)
             VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, ShadowValue);  /* shadow = original */
         }
         else if (CrNum == 4) {
-            /* Keep VMXE bit set in actual CR4, but hide from guest */
-            ULONG64 ActualCr4 = NewValue | CR4_VMXE;
-            VmxWrite(VMCS_GUEST_CR4, ActualCr4);
-            VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, NewValue);
+            /*
+             * BUG FIX (Audit #2): Apply VMX CR4 Fixed-Bit adjustment,
+             * same pattern as CR0 above.  SDM §26.3.1.1 requires Guest
+             * CR4 to satisfy FIXED0/FIXED1 constraints at VM-Entry.
+             *
+             * We also keep VMXE set in the actual Guest CR4 (the Guest
+             * VMCS field) and store the Guest's original value (minus
+             * VMXE) in ReadShadow so MOV-from-CR4 returns the Guest's
+             * intended value without VMXE.
+             */
+            ULONG64 ShadowCr4 = NewValue;                   /* Guest's original */
+            NewValue |= __readmsr(MSR_IA32_VMX_CR4_FIXED0);
+            NewValue &= __readmsr(MSR_IA32_VMX_CR4_FIXED1);
+            NewValue |= CR4_VMXE;                           /* Keep VMXE */
+            VmxWrite(VMCS_GUEST_CR4, NewValue);
+            VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, ShadowCr4);
         }
         break;
 
@@ -881,6 +916,12 @@ static BOOLEAN HandleCrAccess(PGUEST_CONTEXT Ctx)
             ULONG64 Cr0 = VmxRead(VMCS_GUEST_CR0);
             Cr0 &= ~(1ULL << 3);  /* Clear TS bit */
             VmxWrite(VMCS_GUEST_CR0, Cr0);
+            /*
+             * BUG FIX (Audit #3): Sync ReadShadow so Guest MOV-from-CR0
+             * returns the updated TS bit.  Without this, the Guest sees
+             * a stale value because ReadShadow still has TS=1.
+             */
+            VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, Cr0);
         }
         break;
 
@@ -1199,8 +1240,10 @@ static BOOLEAN HandleVmcall(PGUEST_CONTEXT Ctx)
 
     /*
      * Unknown VMCALL — not ours.
-     * On bare metal, CPUID reports "Hv#0" (non-conformant), so Windows
-     * should not issue VMCALLs for enlightenments. Inject #UD.
+     * On bare metal, the hypervisor-present bit (CPUID.1:ECX[31]) is
+     * cleared, so Windows treats this as bare-metal and does NOT issue
+     * Hyper-V VMCALL enlightenments.  Any VMCALL reaching here is from
+     * third-party probing or malicious code — inject #UD.
      */
     {
         static volatile LONG s_UnknownVmcallCount = 0;
@@ -1233,6 +1276,7 @@ static BOOLEAN HandleXsetbv(PGUEST_CONTEXT Ctx)
      *   - Bit 0 (x87) must always be 1
      *   - If bit 2 (AVX) is set, bit 1 (SSE) must also be set
      *   - XCR index must be 0 (only XCR0 is currently defined)
+     *   - Reserved bits (undefined in the current processor) must be 0
      *
      * If validation fails, inject #GP(0) into the Guest instead.
      */
@@ -1249,6 +1293,40 @@ static BOOLEAN HandleXsetbv(PGUEST_CONTEXT Ctx)
     if ((Value & (1ULL << 2)) && !(Value & (1ULL << 1))) {
         /* AVX (bit 2) requires SSE (bit 1) */
         goto InjectGp;
+    }
+
+    /*
+     * BUG FIX (Audit #4): Reject writes to reserved XCR0 bits.
+     *
+     * Intel SDM Vol 1 §13.3: "Writes to reserved bits in XCR0 will
+     * cause a general-protection fault."  The reserved mask is
+     * processor-generation dependent.  We use a conservative mask
+     * covering all currently-defined XCR0 bits (x87, SSE, AVX,
+     * BNDREG, BNDCSR, OPMASK, ZMM_HI256, Hi16_ZMM) plus PKRU
+     * (bit 9).  Any bit outside this mask is reserved and should
+     * cause #GP(0) in the Guest, not a Host crash.
+     *
+     * Bits defined as of SDM (Oct 2023):
+     *   0 = x87 FPU/MMX
+     *   1 = SSE
+     *   2 = AVX (YMM)
+     *   3 = BNDREG (MPX bound registers)
+     *   4 = BNDCSR (MPX bound configuration)
+     *   5 = OPMASK (AVX-512 opmask)
+     *   6 = ZMM_HI256 (AVX-512 upper halves of ZMM0-15)
+     *   7 = Hi16_ZMM (AVX-512 ZMM16-31)
+     *   9 = PKRU (protection key rights for user pages)
+     */
+    {
+        ULONG64 Xcr0DefinedMask =
+            (1ULL << 0) | (1ULL << 1) | (1ULL << 2) |
+            (1ULL << 3) | (1ULL << 4) |
+            (1ULL << 5) | (1ULL << 6) | (1ULL << 7) |
+            (1ULL << 9);
+        if (Value & ~Xcr0DefinedMask) {
+            VMXROOT_LOG_WARN("XSETBV: reserved bits set (Value=0x%llX), injecting #GP", Value);
+            goto InjectGp;
+        }
     }
 
     /* Execute the real XSETBV via ASM wrapper (WDK 7600 has no _xsetbv intrinsic) */

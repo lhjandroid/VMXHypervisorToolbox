@@ -386,10 +386,10 @@ static VOID SvmInitMsrpm(PVOID Msrpm)
     SvmMsrpmSetBit(Msrpm, 0x01D9, TRUE, TRUE);   /* IA32_DEBUGCTL */
 
     /*
-     * NESTED VIRTUALIZATION: Intercept VMX/SVM capability MSRs.
+     * Intercept VMX/SVM capability MSRs.
      *
      * On AMD, guest software may probe Intel VMX MSRs (0x480-0x491) to check
-     * for nested VMX support, or SVM-specific MSRs (VM_CR, VM_HSAVE_PA) to
+     * for VMX support, or SVM-specific MSRs (VM_CR, VM_HSAVE_PA) to
      * detect/configure SVM. We intercept these and return spoofed values
      * (handled in HandleRdmsrImpl/HandleWrmsrImpl) to hide virtualization
      * capabilities from the guest.
@@ -539,6 +539,18 @@ static VOID SvmInitVmcb(PSVM_CPU_CONTEXT CpuCtx)
      * implement the AMD APM Vol.2 §15.9 wait-for-interrupt protocol
      * (setting VMCB.Control.IntState and re-VMRUNing).
      */
+    /*
+     * BUG FIX (Audit #1): Do NOT intercept INTR (physical interrupts).
+     *
+     * AMD APM Vol.2 §15.7: intercepted physical interrupts are NOT auto-
+     * acknowledged — they remain pending in the LAPIC and cause a VMEXIT
+     * storm (VMRUN → INTR pending → immediate VMEXIT → VMRUN → ...),
+     * making the system completely unusable (100% CPU in VMEXIT loop).
+     *
+     * Aligned with Intel VMX: PIN_BASED_EXTERNAL_INT_EXIT is NOT set.
+     * External interrupts pass directly through Guest IDT without any
+     * hypervisor involvement (Blue Pill design).
+     */
     Vmcb->Control.Intercept =
         (1ULL << SVM_INTERCEPT_CPUID) |
         (1ULL << SVM_INTERCEPT_MSR_PROT) |
@@ -552,7 +564,6 @@ static VOID SvmInitVmcb(PSVM_CPU_CONTEXT CpuCtx)
         (1ULL << SVM_INTERCEPT_STGI) |
         (1ULL << SVM_INTERCEPT_CLGI) |
         (1ULL << SVM_INTERCEPT_SKINIT) |
-        (1ULL << SVM_INTERCEPT_INTR) |      /* Intercept physical interrupts */
         (1ULL << SVM_INTERCEPT_NMI);
 
     /* IOPM and MSRPM base addresses */

@@ -241,13 +241,13 @@ VOID MsrBitmapInitialize(PVOID MsrBitmap)
     MsrBitmapSetBit(MsrBitmap, MSR_IA32_DEBUGCTL, TRUE, TRUE);
 
     /*
-     * NESTED VIRTUALIZATION: Intercept VMX capability MSRs.
+     * Intercept VMX capability MSRs.
      *
-     * Guest software (or a nested hypervisor) may probe VMX capability MSRs
-     * (IA32_VMX_BASIC through IA32_VMX_VMFUNC, MSR range 0x480-0x491) to
-     * discover VMX features before attempting VMXON. We intercept these and
-     * return zero to indicate VMX is not available, consistent with the CPUID
-     * hiding of VMX capability bit (CPUID.1:ECX[5]).
+     * Guest software may probe VMX capability MSRs (IA32_VMX_BASIC through
+     * IA32_VMX_VMFUNC, MSR range 0x480-0x491) to discover VMX features
+     * before attempting VMXON.  We intercept these and return zero to
+     * indicate VMX is not available, consistent with the CPUID hiding of
+     * the VMX capability bit (CPUID.1:ECX[5]).
      *
      * Also intercept IA32_FEATURE_CONTROL (0x3A) to hide the VMXON-enabled
      * bit and prevent the guest from attempting to enable VMX.
@@ -276,14 +276,14 @@ BOOLEAN HandleRdmsrImpl(PGUEST_CONTEXT GuestContext)
     GuestCr3 = HvReadGuestCr3();
 
     /*
-     * NESTED VIRTUALIZATION: Intercept VMX/SVM capability MSRs.
+     * Intercept VMX/SVM capability MSRs.
      *
      * Return zero for all VMX capability MSRs (0x480-0x491) and hide the
-     * VMXON-enabled bit in IA32_FEATURE_CONTROL. Also handle SVM-related
+     * VMXON-enabled bit in IA32_FEATURE_CONTROL.  Also handle SVM-related
      * MSRs (VM_CR, VM_HSAVE_PA) if running on AMD.
      *
-     * This prevents guest software from discovering virtualization capabilities,
-     * consistent with the CPUID hiding of VMX/SVM bits.
+     * This prevents guest software from discovering virtualization
+     * capabilities, consistent with the CPUID hiding of VMX/SVM bits.
      */
     if (Msr >= 0x0480 && Msr <= 0x0491) {
         /* VMX capability MSRs: return 0 (VMX not available) */
@@ -331,38 +331,19 @@ BOOLEAN HandleRdmsrImpl(PGUEST_CONTEXT GuestContext)
     }
 
     /*
-     * HYPER-V SYNTHETIC MSR EMULATION (0x40000000 - 0x400000FF)
+     * Hyper-V synthetic MSRs (0x40000000-0x400000FF):
      *
-     * When we advertise "Microsoft Hv" in CPUID leaf 0x40000000, Windows
-     * will read Hyper-V synthetic MSRs during initialization. These MSRs
-     * don't exist on real hardware — executing __readmsr() on them causes
-     * #GP in VMX root mode.
+     * On bare metal, the hypervisor-present bit (CPUID.1:ECX[31]) is
+     * cleared, so Windows will NOT query Hyper-V synthetic MSRs.
      *
-     * These MSRs are also OUTSIDE the MSR bitmap coverage ranges
-     * (0x00000000-0x00001FFF and 0xC0000000-0xC0001FFF), so they ALWAYS
-     * cause VM-Exit regardless of bitmap settings.
-     *
-     * We must emulate them by returning sensible values.
-     *
-     * Key MSRs:
-     *   0x40000000 = HV_X64_MSR_GUEST_OS_ID
-     *   0x40000001 = HV_X64_MSR_HYPERCALL (hypercall page setup)
-     *   0x40000002 = HV_X64_MSR_VP_INDEX
-     *   0x40000003 = HV_X64_MSR_RESET
-     *   0x40000070 = HV_X64_MSR_REFERENCE_TSC
-     *   0x40000073 = HV_X64_MSR_VP_ASSIST_PAGE
-     *   0x40000100 = HV_X64_MSR_SCONTROL (Synic control)
-     *   0x40000101 = HV_X64_MSR_SVERSION (Synic version)
-     *   0x40000102 = HV_X64_MSR_SIEFP (Synic event flags page)
-     *   0x40000103 = HV_X64_MSR_SIMP (Synic message page)
-     *   0x40000104 = HV_X64_MSR_EOM (End of message)
-     *   0x40000105 = HV_X64_MSR_SINT0 (Synthetic interrupt source 0)
-     *   0x40000106-0x4000010F = HV_X64_MSR_SINT1-SINT15
+     * These MSRs are OUTSIDE the standard MSR bitmap ranges and always
+     * cause VM-Exit.  If they reach this handler (third-party tool probing),
+     * inject #GP(0) — they don't exist on bare metal and the Guest
+     * should see the same #GP it would get on real hardware.
      */
     if (Msr >= 0x40000000 && Msr <= 0x400000FF) {
-        GuestContext->Rax = 0;
-        GuestContext->Rdx = 0;
-        HvAdvanceGuestRip();
+        HvInjectException(13, INTERRUPT_TYPE_HARDWARE_EXCEPTION, TRUE, 0);
+        HvSetEntryInstructionLength(HvReadExitInstructionLength());
         return TRUE;
     }
 
@@ -398,13 +379,12 @@ BOOLEAN HandleRdmsrImpl(PGUEST_CONTEXT GuestContext)
     }
 
     /*
-     * SAFETY NET: Reject MSRs outside all known ranges.
+     * SAFETY NET: Reject MSRs outside the standard MSR ranges.
      *
      * MSRs outside the bitmap-covered ranges (0x0-0x1FFF, 0xC0000000-0xC0001FFF)
-     * and outside our handled synthetic ranges (0x40000000-0x400000FF) ALWAYS
-     * cause VM-Exit regardless of bitmap settings. Executing __readmsr() on
-     * a non-existent MSR causes #GP in VMX root mode (unrecoverable → triple
-     * fault → VM shutdown). Inject #GP(0) to Guest instead.
+     * ALWAYS cause VM-Exit regardless of bitmap settings.  Executing
+     * __readmsr() on a non-existent MSR causes #GP in VMX root mode
+     * (unrecoverable → triple fault → VM shutdown). Inject #GP(0) instead.
      */
     if (!((Msr <= 0x1FFF) || (Msr >= 0xC0000000 && Msr <= 0xC0001FFF))) {
         /* Unknown MSR outside handled ranges → inject #GP */
@@ -469,7 +449,7 @@ BOOLEAN HandleWrmsrImpl(PGUEST_CONTEXT GuestContext)
                         ((GuestContext->Rdx & 0xFFFFFFFF) << 32);
 
     /*
-     * NESTED VIRTUALIZATION: Block writes to VMX/SVM capability MSRs.
+     * Block writes to VMX/SVM capability MSRs.
      *
      * VMX MSRs (0x480-0x491) are read-only; writes should #GP.
      * IA32_FEATURE_CONTROL (0x3A) writes could enable VMXON; block them.
@@ -489,24 +469,17 @@ BOOLEAN HandleWrmsrImpl(PGUEST_CONTEXT GuestContext)
     }
 
     /*
-     * HYPER-V SYNTHETIC MSR EMULATION (0x40000000 - 0x400000FF)
+     * Hyper-V synthetic MSRs (0x40000000-0x400000FF):
      *
-     * Windows writes to these MSRs to configure Hyper-V synthetic devices
-     * (SynIC, hypercall page, reference TSC, etc.) when it detects a Hyper-V
-     * compatible hypervisor via CPUID.
+     * On bare metal, these MSRs don't exist and writing to them would
+     * #GP on real hardware.  Inject #GP(0) to match bare-metal behaviour.
      *
-     * These MSRs don't exist on real hardware. Executing __writemsr() on
-     * them causes #GP in VMX root mode. The __try/__except MAY catch it,
-     * but the injected #GP into the Guest causes BSOD 0x1AA because Windows
-     * kernel doesn't expect #GP when writing Hyper-V MSRs.
-     *
-     * FIX: Silently absorb the writes. Windows will think the MSR was
-     * written successfully. Since we don't actually implement SynIC or
-     * reference TSC, the features simply won't work, but that's safe —
-     * Windows falls back gracefully.
+     * Windows will not access these MSRs because CPUID.1:ECX[31]=0 on
+     * bare metal — this handler only catches third-party probing.
      */
     if (Msr >= 0x40000000 && Msr <= 0x400000FF) {
-        HvAdvanceGuestRip();
+        HvInjectException(13, INTERRUPT_TYPE_HARDWARE_EXCEPTION, TRUE, 0);
+        HvSetEntryInstructionLength(HvReadExitInstructionLength());
         return TRUE;
     }
 
@@ -527,13 +500,12 @@ BOOLEAN HandleWrmsrImpl(PGUEST_CONTEXT GuestContext)
     }
 
     /*
-     * SAFETY NET: Reject MSRs outside all known ranges.
+     * SAFETY NET: Reject MSRs outside the standard MSR ranges.
      *
      * MSRs outside the bitmap-covered ranges (0x0-0x1FFF, 0xC0000000-0xC0001FFF)
-     * and outside our handled synthetic ranges (0x40000000-0x400000FF) ALWAYS
-     * cause VM-Exit regardless of bitmap settings. Executing __writemsr() on
-     * a non-existent MSR causes #GP in VMX root mode (unrecoverable → triple
-     * fault → VM shutdown). Inject #GP(0) to Guest instead.
+     * ALWAYS cause VM-Exit regardless of bitmap settings.  Executing
+     * __writemsr() on a non-existent MSR causes #GP in VMX root mode
+     * (unrecoverable → triple fault → VM shutdown). Inject #GP(0) instead.
      */
     if (!((Msr <= 0x1FFF) || (Msr >= 0xC0000000 && Msr <= 0xC0001FFF))) {
         /* Unknown MSR outside handled ranges → inject #GP */

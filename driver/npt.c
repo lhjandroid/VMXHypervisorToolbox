@@ -1824,7 +1824,24 @@ VOID NptInvalidateAll(VOID)
 
     for (i = 0; i < g_SvmState.CpuCount; i++) {
         if (g_SvmState.CpuContexts[i].VmcbVa) {
-            g_SvmState.CpuContexts[i].VmcbVa->Control.TlbCtl = TLB_CONTROL_FLUSH_ALL_ASID;
+            PVMCB Vmcb = g_SvmState.CpuContexts[i].VmcbVa;
+            Vmcb->Control.TlbCtl = TLB_CONTROL_FLUSH_ALL_ASID;
+
+            /*
+             * BUG FIX (Audit #2): Clear VMCB Clean Bits bit 0 so the
+             * CPU re-reads TlbCtl from memory on the next VMRUN.
+             *
+             * AMD APM Vol.2 §15.5.1: Clean Bits bit 0 controls
+             * Intercept vectors, TSC Offset, Pause Filter, AND TlbCtl.
+             * When this bit is 1, the CPU skips re-reading TlbCtl.
+             *
+             * This call is often made from IOCTL context (PASSIVE_LEVEL),
+             * where the VMCB's Clean Bits may have been set to 1 by a
+             * previous VMRUN.  Without clearing bit 0, the TlbCtl write
+             * above would be ignored and the TLB flush wouldn't happen,
+             * leaving stale NPT translations after a hook install/remove.
+             */
+            Vmcb->Control.CleanBits &= ~(1UL << 0);
         }
     }
 }

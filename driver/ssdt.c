@@ -8,8 +8,8 @@
  * for the LONG array where entry decoding matches all known pairs.
  *
  * This approach is independent of IA32_LSTAR / KiSystemCall64 code layout
- * and works reliably across all x64 Windows versions (Vista through Win11),
- * including systems with KPTI, VBS, and Hyper-V nested virtualization.
+ * and works reliably across all x64 Windows versions (Vista through Win11)
+ * on bare-metal systems.
  *
  * All hook mechanics delegate to GenericHookInstall() / GenericHookRemove().
  */

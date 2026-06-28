@@ -131,6 +131,7 @@ BOOLEAN SvmExitHandler(PGUEST_CONTEXT GuestContext)
          *   - Bit 0 (x87) must always be 1
          *   - If bit 2 (AVX) is set, bit 1 (SSE) must also be set
          *   - XCR index must be 0 (only XCR0 is currently defined)
+         *   - Reserved bits must be 0
          *
          * If validation fails, inject #GP(0) into the Guest instead.
          */
@@ -141,32 +142,46 @@ BOOLEAN SvmExitHandler(PGUEST_CONTEXT GuestContext)
 
             if (Ecx != 0) {
                 /* Only XCR0 (index 0) is valid; all others -> #GP(0) */
-                Vmcb->Control.EventInj = SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_EXEPT |
-                                         SVM_EVTINJ_VALID_ERR | 13;
-                Vmcb->Control.EventInjErr = 0;
-                break;
+                goto SvmXsetbvInjectGp;
             }
 
             if (!(Value & 1)) {
                 /* Bit 0 (x87 FPU) must be 1 */
-                Vmcb->Control.EventInj = SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_EXEPT |
-                                         SVM_EVTINJ_VALID_ERR | 13;
-                Vmcb->Control.EventInjErr = 0;
-                break;
+                goto SvmXsetbvInjectGp;
             }
 
             if ((Value & (1ULL << 2)) && !(Value & (1ULL << 1))) {
                 /* AVX (bit 2) requires SSE (bit 1) */
-                Vmcb->Control.EventInj = SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_EXEPT |
-                                         SVM_EVTINJ_VALID_ERR | 13;
-                Vmcb->Control.EventInjErr = 0;
-                break;
+                goto SvmXsetbvInjectGp;
+            }
+
+            /*
+             * BUG FIX (Audit #4): Reject writes to reserved XCR0 bits.
+             * Same mask as Intel VMX side: bits 0-7 + bit 9 (PKRU).
+             * Any bit outside this mask is reserved and must cause #GP.
+             */
+            {
+                ULONG64 Xcr0DefinedMask =
+                    (1ULL << 0) | (1ULL << 1) | (1ULL << 2) |
+                    (1ULL << 3) | (1ULL << 4) |
+                    (1ULL << 5) | (1ULL << 6) | (1ULL << 7) |
+                    (1ULL << 9);
+                if (Value & ~Xcr0DefinedMask) {
+                    VMXROOT_LOG_WARN("SVM XSETBV: reserved bits set (Value=0x%llX), injecting #GP", Value);
+                    goto SvmXsetbvInjectGp;
+                }
             }
 
             /* Valid XCR0 - execute the real XSETBV */
             AsmXsetbv(Ecx, Value);
             HvAdvanceGuestRip();
         }
+        break;
+
+    SvmXsetbvInjectGp:
+        Vmcb->Control.EventInj = SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_EXEPT |
+                                 SVM_EVTINJ_VALID_ERR | 13;
+        Vmcb->Control.EventInjErr = 0;
         break;
 
     /* ===== CR Access ===== */
@@ -184,10 +199,20 @@ BOOLEAN SvmExitHandler(PGUEST_CONTEXT GuestContext)
 
     case SVM_EXIT_READ_DR0: case SVM_EXIT_READ_DR1:
     case SVM_EXIT_READ_DR2: case SVM_EXIT_READ_DR3:
+    case SVM_EXIT_READ_DR4: case SVM_EXIT_READ_DR5:
     case SVM_EXIT_READ_DR6: case SVM_EXIT_READ_DR7:
     case SVM_EXIT_WRITE_DR0: case SVM_EXIT_WRITE_DR1:
     case SVM_EXIT_WRITE_DR2: case SVM_EXIT_WRITE_DR3:
+    case SVM_EXIT_WRITE_DR4: case SVM_EXIT_WRITE_DR5:
     case SVM_EXIT_WRITE_DR6: case SVM_EXIT_WRITE_DR7:
+        /*
+         * BUG FIX (Audit #3): DR4/DR5 exit codes added.
+         * Some AMD CPUs generate separate exit codes for DR4/DR5
+         * even though the registers alias DR6/DR7 in silicon.
+         * Without these case labels, DR4/DR5 exits fall through
+         * to the default handler (which doesn't advance RIP →
+         * infinite loop).
+         */
         Result = SvmHandleDrAccess(GuestContext, ExitCode);
         break;
 
@@ -210,7 +235,14 @@ BOOLEAN SvmExitHandler(PGUEST_CONTEXT GuestContext)
     /* ===== Interrupts ===== */
 
     case SVM_EXIT_INTR:
-        /* Physical interrupt - just resume, interrupt will be delivered */
+        /*
+         * BUG FIX (Audit #1): INTR is no longer intercepted (see
+         * svm_init.c).  Keep this case as a defensive no-op: if a
+         * future config accidentally re-enables INTR intercept,
+         * breaking out of the switch keeps the guest alive (the
+         * interrupt remains pending on the LAPIC and will cause
+         * another VMEXIT → storm, but won't corrupt state).
+         */
         break;
 
     case SVM_EXIT_NMI:
@@ -325,6 +357,21 @@ static BOOLEAN SvmHandleCrAccess(PGUEST_CONTEXT Ctx, ULONG ExitCode)
     switch (ExitCode) {
     case SVM_EXIT_WRITE_CR0:
         Value = SvmGetGpReg(Ctx, GpReg);
+        /*
+         * BUG FIX (Audit #5): Basic CR0 consistency check.
+         *
+         * AMD SVM does not have Intel's CR0 Fixed-Bit MSRs, but the
+         * x86-64 architecture still requires basic CR0 invariants:
+         *   - PG=1 requires PE=1 (paging requires protected mode)
+         *   - NW=1 && CD=1 is not cache-coherent on modern CPUs
+         *
+         * If the guest writes an invalid combination, VMRUN may
+         * succeed but the guest will immediately triple-fault.
+         * We apply minimum corrections: if PG=1, force PE=1.
+         */
+        if ((Value & CR0_PG) && !(Value & CR0_PE)) {
+            Value |= CR0_PE;  /* Force PE=1 when PG=1 */
+        }
         Vmcb->Save.Cr0 = Value;
         break;
 

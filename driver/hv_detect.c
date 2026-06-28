@@ -178,3 +178,78 @@ ULONG HvGetMaxAsid(VOID)
     __cpuid(CpuInfo, SVM_CPUID_FUNC);
     return (ULONG)CpuInfo[1];  /* EBX = number of ASIDs */
 }
+
+/* ========================================================================= */
+/*  Bare-Metal / Hyper-V Detection                                            */
+/* ========================================================================= */
+
+/*
+ * HvIsRunningUnderHypervisor - Detect if already running under a hypervisor.
+ *
+ * Intel SDM Vol 3, §2.2: "When CPUID executes with input EAX=1, bit 31 of
+ * ECX indicates the presence of a hypervisor."
+ *
+ * We check two independent signals:
+ *   1. CPUID.1:ECX[31] — set by all major hypervisors
+ *   2. CPUID.0x40000000:EAX — returns max hypervisor leaf (>0 means present)
+ *
+ * If EITHER indicates a hypervisor, we are NOT on bare metal.
+ */
+BOOLEAN HvIsRunningUnderHypervisor(VOID)
+{
+    int CpuInfo[4];
+
+    /* Check 1: CPUID.1:ECX bit 31 (hypervisor present) */
+    __cpuid(CpuInfo, 1);
+    if (CpuInfo[2] & (1 << 31)) {
+        LOG_WARN("Detected existing hypervisor: CPUID.1:ECX[31]=1");
+        return TRUE;
+    }
+
+    /* Check 2: CPUID 0x40000000 (hypervisor vendor leaf).
+     * On bare metal, this normally returns EAX=0 (max leaf = 0,
+     * meaning "no hypervisor CPUID leaves"). */
+    __cpuid(CpuInfo, 0x40000000);
+    if ((ULONG)CpuInfo[0] > 0) {
+        LOG_WARN("Detected existing hypervisor: CPUID.0x40000000 max leaf=%u", CpuInfo[0]);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+/*
+ * HvIsHyperVEnabled - Detect if Windows Hyper-V is active.
+ *
+ * When Windows Hyper-V (HypervisorPlatform, HypervisorEnforcedCodeIntegrity/HVCI,
+ * or VBS) is running, CPUID.0x40000001 returns "Hv#1" (conformant interface
+ * signature = 0x31237648).  On bare metal or with a non-Hyper-V hypervisor,
+ * leaf 0x40000001 returns 0 or "Hv#0".
+ *
+ * This is separate from HvIsRunningUnderHypervisor because Hyper-V can be
+ * enabled at the Windows kernel level AND at the hardware level.
+ */
+BOOLEAN HvIsHyperVEnabled(VOID)
+{
+    int CpuInfo[4];
+
+    /*
+     * Check if hypervisor vendor leaf exists (EAX > 0 means a hypervisor
+     * provides CPUID leaves starting at 0x40000000).
+     */
+    __cpuid(CpuInfo, 0x40000000);
+    if ((ULONG)CpuInfo[0] < 0x40000001) {
+        /* No hypervisor leaf, or max leaf < 1 → can't be Hyper-V */
+        return FALSE;
+    }
+
+    /* Check the interface signature at leaf 0x40000001.
+     * "Hv#1" = 0x31237648 means Hyper-V with conformant interface */
+    __cpuid(CpuInfo, 0x40000001);
+    if ((ULONG)CpuInfo[0] == 0x31237648) {
+        LOG_WARN("Detected Windows Hyper-V: Hv#1 interface active");
+        return TRUE;
+    }
+
+    return FALSE;
+}

@@ -133,7 +133,7 @@ static BOOLEAN VmxCheckCapabilities(PVMX_STATE State)
 /* ========================================================================= */
 
 /*
- * Adjust control fields per Intel SDM Vol. 3C, Section 31.5.1
+ * Adjust control fields per Intel SDM Vol. 3C, Section 24.6.1
  * Low 32 bits = allowed 0-settings (must-be-1)
  * High 32 bits = allowed 1-settings (can-be-1)
  */
@@ -550,27 +550,44 @@ NTSTATUS VmxSetupVmcs(PVMX_CPU_CONTEXT CpuCtx, PVMX_STATE State)
     /* CR0/CR4 guest/host masks and read shadows */
 
     /*
-     * CR0 Guest-Host Mask: intercept writes to VMX-restricted bits.
+     * CR0 Guest-Host Mask: intercept writes to ALL VMX-restricted bits.
      *
-     * VMX requires certain CR0 bits to match MSR_IA32_VMX_CR0_FIXED0/FIXED1.
-     * If the Guest directly modifies these bits (MOV CR0) without going through
-     * our handler, the value may violate Fixed Bit constraints, causing the
-     * next VM-Entry to fail.
+     * Intel SDM Vol. 3C, Section 26.3.1.1 requires Guest CR0 to satisfy:
+     *   (CR0 & FIXED0) == 0  — must-be-0 bits
+     *   (CR0 | FIXED1) == FIXED1 — must-be-1 bits
      *
-     * By setting the Mask to CR0_FIXED0 (bits that must be 1), any Guest write
-     * that touches these bits triggers a VM-Exit → HandleCrAccess applies
-     * Fixed0/Fixed1 adjustment before writing to VMCS Guest CR0.
+     * BUG FIX (Audit #1): Originally only used FIXED0 as the mask, which
+     * missed must-be-1 bits (FIXED1=1, FIXED0=0).  A guest write clearing
+     * a must-be-1 bit (e.g. CR0.PE, CR0.PG, CR0.NE) would go through
+     * un-intercepted, causing the next VM-Entry to fail.
      *
-     * ReadShadow stores the Guest's view of the masked bits so that MOV-from-CR0
-     * returns the value the Guest expects (before VMX adjustment).
+     * The correct mask uses XOR: FIXED0 ^ FIXED1 captures every bit that
+     * is fixed in EITHER direction (bit must be 0 OR must be 1).
+     *
+     * ReadShadow stores the Guest's un-adjusted value so that MOV-from-CR0
+     * returns what the Guest originally wrote.
      */
     {
         ULONG64 Cr0Fixed0 = __readmsr(MSR_IA32_VMX_CR0_FIXED0);
-        VmxWrite(VMCS_CTRL_CR0_GUEST_HOST_MASK, Cr0Fixed0);
-        VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, Cr0 & Cr0Fixed0);
+        ULONG64 Cr0Fixed1 = __readmsr(MSR_IA32_VMX_CR0_FIXED1);
+        VmxWrite(VMCS_CTRL_CR0_GUEST_HOST_MASK, Cr0Fixed0 ^ Cr0Fixed1);
+        VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, Cr0);
     }
-    VmxWrite(VMCS_CTRL_CR4_GUEST_HOST_MASK, CR4_VMXE);  /* Hide VMXE from guest */
-    VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, Cr4 & ~CR4_VMXE);
+
+    /*
+     * CR4 Guest-Host Mask: same fix as CR0 above (Audit #2).
+     *
+     * Originally only intercepted VMXE (bit 13), missing other
+     * VMX-constrained CR4 bits.  Now uses FIXED0 ^ FIXED1 | VMXE
+     * to cover every restricted CR4 bit plus VMXE hiding.
+     */
+    {
+        ULONG64 Cr4Fixed0 = __readmsr(MSR_IA32_VMX_CR4_FIXED0);
+        ULONG64 Cr4Fixed1 = __readmsr(MSR_IA32_VMX_CR4_FIXED1);
+        VmxWrite(VMCS_CTRL_CR4_GUEST_HOST_MASK,
+                 (Cr4Fixed0 ^ Cr4Fixed1) | CR4_VMXE);
+        VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, Cr4 & ~CR4_VMXE);
+    }
 
     /* TSC Offset */
     VmxWrite(VMCS_CTRL_TSC_OFFSET, 0);

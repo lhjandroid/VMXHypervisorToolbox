@@ -1,8 +1,10 @@
 # VMX Hypervisor Toolbox
 
-基于 Intel VT-x (VMX) 和 AMD SVM 的 Windows x64 Hypervisor 工具箱。通过在操作系统下方插入一层轻量级 Type-2 Hypervisor，提供多种运行在 Ring -1 层面的底层能力，包括反反调试、绕过 PatchGuard 的内核 Hook 框架、基于物理内存直接访问的进程内存读写等，且后续将持续扩展更多基于 VMX 的高级功能。
+基于 Intel VT-x (VMX) 和 AMD SVM 的 Windows x64 Hypervisor 工具箱。通过在操作系统下方插入一层轻量级 Type-2 (Blue Pill) Hypervisor，提供多种运行在 Ring -1 层面的底层能力，包括反反调试、绕过 PatchGuard 的内核 Hook 框架、基于物理内存直接访问的进程内存读写等，且后续将持续扩展更多基于 VMX 的高级功能。
 
 **支持双平台**: 自动检测 CPU 厂商 (Intel/AMD)，选择对应的虚拟化后端。
+
+**⚠️ 仅支持裸机 (Bare Metal)**: 不支持嵌套虚拟化，不支持 Hyper-V / VBS / HVCI / VirtualBox / VMware / KVM / Xen 等任何其他 Hypervisor 环境。DriverEntry 会在初始化时检测并拒绝非裸机环境。
 
 ---
 
@@ -19,7 +21,7 @@
 >
 > 使用、下载、编译、修改或分发本软件即视为您接受 [`LICENSE`](LICENSE) 全部条款。违反协议将自动终止您的使用权，并可能承担侵权法律责任。
 
-> **2026-04 稳定性 Review（两轮）**: 完成了针对裸机运行的全面代码 Review + 一次更严格的二次 Review，合计修复 **36 项**跨级别问题（首轮 17 + 二次补救 19，含 SVM VMSAVE/VMLOAD host-state 缺失致 BSOD、AAD VMX 侧从未工作、nonce 认证不完备等致命 bug），详见 [docs/BAREMETAL_REVIEW_FIXES.md](docs/BAREMETAL_REVIEW_FIXES.md)。重要 API 变化：<br>• `AsmSvmLaunch` 签名为 `(VmcbPa, VmcbVa, HostVmcbPa)`，Host VMCB 用于 VMSAVE/VMLOAD 保护 host extra-state。<br>• Shutdown VMCALL/VMMCALL 现需要 `g_VmcallShutdownNonce` + long-mode + CS.L + kernel-RIP 完整认证。<br>• `VmxSetExceptionInterceptBp/Db` 新 API — VMX 侧 AAD_HIDE_EXCEPTIONS 现在真正工作。<br>• `ProcessRegisterExceptionHideToggle` 解耦 process 模块与 SVM/VMX 后端。<br>• VMCALL 内存操作路径已**注入 #UD 失败**；用户态必须使用 IOCTL。<br>• EPT/NPT 身份映射现动态扩展支持 > 512GB 物理内存（`g_EptPdptTotal / g_NptPdptTotal`）。
+> **2026-06 审计修复 + 裸机独占**: 完成基于 Intel SDM Vol 3C 的 VMX 代码合规性审计，修复 **2 项严重 bug** + **4 项警告**（CR0/CR4 Guest/Host Mask 仅覆盖部分 VMX 约束位、XSETBV 保留位未检查、IDT-Vectoring 外部中断类型重注入、CLTS ReadShadow 未同步等），详见 [docs/audit/intel-vmx-code-audit.md](docs/audit/intel-vmx-code-audit.md)。<br>• **裸机独占**: 移除全部 Hyper-V 兼容代码（CPUID 0x40000000+、合成 MSR 0x40000000-0x400000FF），DriverEntry 增加 `HvIsRunningUnderHypervisor()` + `HvIsHyperVEnabled()` 双重检测，非裸机则 `return STATUS_NOT_SUPPORTED`。<br>• **CR0 Mask**: 修复为 `FIXED0 ^ FIXED1` 覆盖所有 VMX 约束位 (SDM §26.3.1.1)，防止 Guest 清除必须为 1 的位导致 VM-Entry 失败。<br>• **CR4 Mask**: 修复为 `(FIXED0 ^ FIXED1) | CR4_VMXE`，CR4 写 handler 新增 Fixed-Bit 调整。<br>• **XSETBV**: 新增保留位检查，拒绝写入未定义 XCR0 位。<br>• **IDT-Vectoring**: 外部中断 (type=0) 不再重注入，避免 VM-Entry 失败。
 
 ---
 
@@ -256,7 +258,7 @@ VmxIsSupported():
 
 #### 3. 控制字段调整
 
-遵循 Intel SDM Vol. 3C, Section 31.5.1:
+遵循 Intel SDM Vol. 3C, Section 24.6.1:
 
 ```c
 VmxAdjustControls(Requested, Capability):
@@ -318,18 +320,23 @@ VMCS 配置是整个 Hypervisor 的核心, 决定了哪些事件会触发 VM-Exi
 
 #### CR0/CR4 Guest-Host Mask 与 Read Shadow
 
-```c
-// CR0: 拦截 VMX Fixed Bits (PE, NE, PG 等必须为 1 的位)
-// Guest 修改这些位时触发 VM-Exit → HandleCrAccess 应用 Fixed0/Fixed1 调整
-// 防止 Guest 写入违反 VMX 约束的 CR0 值导致 VM-Entry 失败
-ULONG64 Cr0Fixed0 = __readmsr(MSR_IA32_VMX_CR0_FIXED0);
-VmxWrite(VMCS_CTRL_CR0_GUEST_HOST_MASK, Cr0Fixed0);
-VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, Cr0 & Cr0Fixed0);
+Intel SDM Vol. 3C §26.3.1.1 要求 Guest CR0 和 CR4 同时满足 FIXED0 (必须为 0) 和 FIXED1 (必须为 1) 约束。Mask 用异或公式 `FIXED0 ^ FIXED1` 拦截**所有**受 VMX 约束的位：
 
-// CR4: 仅拦截 VMXE 位, 对 Guest 隐藏 VMX 操作
-VmxWrite(VMCS_CTRL_CR4_GUEST_HOST_MASK, CR4_VMXE);
+```c
+// CR0: 拦截所有 VMX 约束位 (FIXED0 ^ FIXED1)
+ULONG64 Cr0Fixed0 = __readmsr(MSR_IA32_VMX_CR0_FIXED0);
+ULONG64 Cr0Fixed1 = __readmsr(MSR_IA32_VMX_CR0_FIXED1);
+VmxWrite(VMCS_CTRL_CR0_GUEST_HOST_MASK, Cr0Fixed0 ^ Cr0Fixed1);
+VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, Cr0);
+
+// CR4: 拦截所有约束位 + VMXE 隐藏
+ULONG64 Cr4Fixed0 = __readmsr(MSR_IA32_VMX_CR4_FIXED0);
+ULONG64 Cr4Fixed1 = __readmsr(MSR_IA32_VMX_CR4_FIXED1);
+VmxWrite(VMCS_CTRL_CR4_GUEST_HOST_MASK, (Cr4Fixed0 ^ Cr4Fixed1) | CR4_VMXE);
 VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, Cr4 & ~CR4_VMXE);
 ```
+
+> **修复记录** (2026-06 审计): 原代码仅用 FIXED0 作为 Mask，未拦截必须为 1 的位 (如 CR0.PE/PG/NE)。Guest 可通过 MOV CR0 清除这些位而不触发 VM-Exit，下次 VM-Entry 会失败 (SDM §26.3.1.1)。
 
 ### VM-Exit 处理框架
 
@@ -984,19 +991,19 @@ __cpuid(info, 0x4CAFE000);
 if (info[0] == 0x564D5854) printf("Hypervisor active!\n");
 ```
 
-**虚拟化隐藏** (对所有进程无条件生效)：
+**虚拟化隐藏** (对所有进程无条件生效，裸机策略)：
 
 | Leaf | 修改 | 目的 |
 |------|------|------|
-| `CPUID.1:ECX` | 清除 bit 31 (Hypervisor Present) | 隐藏 Hypervisor 存在 |
+| `CPUID.1:ECX` | 清除 bit 31 (Hypervisor Present) | Guest 认为运行在裸机 |
 | `CPUID.1:ECX` | 清除 bit 5 (VMX) | 隐藏 Intel VT-x 支持 |
 | `CPUID.0x80000001:ECX` | 清除 bit 2 (SVM) | 隐藏 AMD-V 支持 |
-| `CPUID.0x8000000A` | 返回全零 | 隐藏 SVM 特性叶（NASID/NPT 支持等） |
-| `CPUID.0x40000000~0x40000006` | 返回全零 | 隐藏 Hypervisor 厂商字符串和接口叶 |
+| `CPUID.0x8000000A` | 返回全零 | 隐藏 SVM 特性叶 |
+| `CPUID.0x40000000+` | 透传硬件 CPUID (裸机返回全零) | 不模拟 Hypervisor 接口 |
 
 ```c
 if (Leaf == 1) {
-    CpuInfo[2] &= ~(1 << CPUID_HYPERVISOR_BIT);   /* Hide hypervisor present */
+    CpuInfo[2] &= ~(1 << CPUID_HYPERVISOR_BIT);   /* Clear: no hypervisor */
     CpuInfo[2] &= ~(1 << 5);                       /* Hide VMX (Intel VT-x) */
 }
 else if (Leaf == 0x80000001) {
@@ -1005,12 +1012,10 @@ else if (Leaf == 0x80000001) {
 else if (Leaf == 0x8000000A) {
     CpuInfo[0] = CpuInfo[1] = CpuInfo[2] = CpuInfo[3] = 0;
 }
-else if (Leaf >= 0x40000000 && Leaf <= 0x40000006) {
-    CpuInfo[0] = CpuInfo[1] = CpuInfo[2] = CpuInfo[3] = 0;
-}
+/* 0x40000000+ leaves: 透传裸机 CPUID (返回全零), 不模拟 */
 ```
 
-**安全性说明**：`__cpuidex()` 先执行真实 CPUID（由 L0 返回），修改发生在 VM-Exit handler 中，仅改变返回给 L2 Guest 的结果。L0 完全不知道我们修改了什么。
+**安全性说明**：`__cpuidex()` 先执行真实 CPUID，修改仅在 VM-Exit handler 中改变返回给 Guest 的结果。裸机策略下，CPUID.1:ECX[31]=0 且所有 Hyper-V 合成 MSR 注入 #GP(0)，Guest 完全感知不到 Hypervisor。
 
 ### MSR 拦截 — 虚拟化能力隐藏
 
@@ -2596,10 +2601,15 @@ build -cZg
 ### 部署步骤
 
 ```cmd
+:: 0. 必须先关闭 Hyper-V / VBS / HVCI (驱动会检测并拒绝)
+bcdedit /set hypervisorlaunchtype off
+bcdedit /set vsmlaunchtype off
+:: 然后重启
+
 :: 1. 启用测试签名 (需管理员权限, 需重启)
 bcdedit /set testsigning on
 
-:: 2. 加载驱动
+:: 2. 重启后加载驱动
 sc create VMXToolboxDrv type=kernel binPath="<项目根目录>\driver\objchk_win7_amd64\amd64\VMXToolboxDrv.sys"
 sc start VMXToolboxDrv
 
@@ -2626,7 +2636,6 @@ sc delete VMXToolboxDrv
 | 内存读写 | 物理内存直接访问，绕过一切内核回调 | ✅ 已完成 |
 | SSDT 监控 | 磁盘映像解析 SSDT + EPT Hook 监控/拦截/过滤 syscall | ✅ 已完成 |
 | Shadow SSDT | Win32k Shadow SSDT 发现 + NtUser*/NtGdi* Hook/监控 | ✅ 已完成 |
-| 裸机运行 | 仅支持裸机环境 | ✅ |
 | 驱动隐藏 | 隐藏自身驱动对象，防止枚举 | 📋 规划中 |
 | 虚拟化保护 | 对目标进程代码段进行 VMX 级别加密保护 | 📋 规划中 |
 | 通信隐藏 | 基于 VMCALL 的隐蔽驱动通信通道 | 📋 规划中 |
@@ -2637,9 +2646,10 @@ sc delete VMXToolboxDrv
 
 | 风险 | 说明 | 应对措施 |
 |------|------|---------|
-| **蓝屏 (BSOD)** | VMX 代码中任何错误都可能导致蓝屏 | 在虚拟机中测试, 双机调试 |
+| **蓝屏 (BSOD)** | VMX 代码中任何错误都可能导致系统蓝屏 | **必须在裸机上测试**，准备好接受蓝屏风险。建议：1) 在次要机器上测试；2) 配置完整内存转储 (`bcdedit /set crashdump vol:c:` + 页面文件)；3) 使用 WinDbg 离线分析 dump 文件；4) 保持 `docs/reference/` 中 Intel/AMD 官方文档在手边辅助调试 |
+| **驱动不支持虚拟机** | 驱动启动时检测 Hypervisor 存在 (CPUID.1:ECX[31]) 和 Hyper-V (CPUID.0x40000001)，非裸机直接拒绝加载 | 确保裸机环境：`bcdedit /set hypervisorlaunchtype off` + `bcdedit /set vsmlaunchtype off`，重启后确认 `systeminfo` 显示"Hyper-V 要求"全部为"否" |
 | **PatchGuard** | Windows 内核补丁保护可能检测异常 | EPT Hook 不修改内核代码, 通常不触发 |
-| **HVCI** | Hypervisor-protected Code Integrity 阻止自定义 Hypervisor | 需关闭 HVCI |
+| **HVCI** | Hypervisor-protected Code Integrity 阻止自定义 Hypervisor | 需关闭 HVCI (`bcdedit /set vsmlaunchtype off`) |
 | **驱动签名** | Windows 10+ 要求驱动签名 | 开发阶段使用 testsigning, 生产需 EV 证书 |
 | **EPROCESS 偏移** | 不同 Windows 版本偏移不同 | 已实现动态发现, 覆盖 Win7~Win11 |
 | **多核同步** | VM-Exit handler 在各核心并行运行 | 使用原子操作和 Spin Lock |

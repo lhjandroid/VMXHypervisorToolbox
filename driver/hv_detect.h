@@ -44,4 +44,26 @@ BOOLEAN HvCheckNptSupport(VOID);
 ULONG HvGetSvmRevision(VOID);
 ULONG HvGetMaxAsid(VOID);
 
+/*
+ * HvIsRunningUnderHypervisor - Detect if we are already running under a
+ * hypervisor (i.e., we are NOT on bare metal).
+ *
+ * Checks CPUID.1:ECX[31] (hypervisor present bit) and CPUID leaf
+ * 0x40000000 (hypervisor vendor ID leaf).  If either reports a
+ * hypervisor, returns TRUE.
+ *
+ * This project MUST run on bare metal: no nested virtualization,
+ * no Hyper-V, no VMware, no VirtualBox, no KVM, no Xen.
+ */
+BOOLEAN HvIsRunningUnderHypervisor(VOID);
+
+/*
+ * HvIsHyperVEnabled - Detect if Windows Hyper-V (HypervisorPlatform or
+ * VirtualSecureMode / VBS) is active by checking for the Hyper-V
+ * synthetic interface via CPUID 0x40000001 (Hv#1 interface ID).
+ *
+ * Returns TRUE if Hyper-V enlightenments are available.
+ */
+BOOLEAN HvIsHyperVEnabled(VOID);
+
 #endif /* _HV_DETECT_H_ */
